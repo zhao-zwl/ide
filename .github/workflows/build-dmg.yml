@@ -1,0 +1,48 @@
+name: Build aidea .dmg
+
+# 在 GitHub 托管的 macOS runner 上构建自包含 aidea .dmg。
+# 选 macos-13（Intel x86_64）以匹配用户机器 triple = x86_64-apple-darwin；
+# 若你的目标机是 Apple Silicon，请把 runs-on 改成 macos-14 / macos-latest（arm64）。
+#
+# 触发：push 到 main/master，或在 Actions 页手动 Run workflow。
+# 产物：Workflow 运行结束后在 Artifacts 区下载 aidea-dmg（含 .dmg）。
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+
+jobs:
+  build-dmg:
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install system deps (ollama, postgresql@17)
+        run: |
+          brew update
+          brew install ollama postgresql@17
+
+      - name: Build aidea dmg (one-shot)
+        run: bash build-aidea-dmg.sh
+        env:
+          # 减小调试信息体积，避免 runner 磁盘打满
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+      - name: Upload .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aidea-dmg
+          path: gui/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

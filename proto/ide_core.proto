@@ -1,0 +1,138 @@
+// ============================================================================
+// Agentic IDE — ProtoBus contract (M1 slice).
+//
+// Package: ide_core  (generated Rust module: ide_core::v1)
+//
+// Defines the two services that form the host<->Core bus:
+//   * AgentService  — implemented by the Core; the host (Tauri / CLI) calls in.
+//   * HostService   — implemented by the host; the Core calls out to drive UI.
+//
+// Server-streaming RPCs model the two streaming flows required by M1:
+//   * NesComplete  — the L0 Tab grey-text stream (T04).
+//   * RunAgent     — the ReAct event stream (T01).
+// This contract is frozen at v0.1 (decision gate G6).
+// ============================================================================
+syntax = "proto3";
+
+package ide_core;
+
+// ----------------------------- shared messages -----------------------------
+message Empty {}
+
+message Pong {
+  string version = 1;
+  int64 uptime_ms = 2;
+}
+
+message Ack {
+  bool ok = 1;
+  string detail = 2;
+}
+
+// ----------------------------- NES completion (L0 Tab) ---------------------
+// A completion request: the text around the cursor plus language id.
+message NesRequest {
+  string session_id = 1;
+  string document_uri = 2;
+  string prefix = 3;   // text before the cursor
+  string suffix = 4;   // text after the cursor
+  string language = 5; // e.g. "rust", "typescript"
+}
+
+// A single grey (ghost) completion candidate streamed back to the host.
+message NesSuggestion {
+  string text = 1;       // suggested completion text
+  float confidence = 2;  // model confidence in [0,1]
+  int32 latency_ms = 3;  // probe latency for this candidate
+}
+
+// ----------------------------- Agent (ReAct loop) --------------------------
+message AgentRequest {
+  string session_id = 1;
+  string goal = 2;
+  string project_id = 3;
+}
+
+// One event in the ReAct trace: thought | action | observation | plan | final.
+message AgentEvent {
+  string kind = 1;
+  string payload = 2;
+  int64 ts_ms = 3;
+}
+
+// ----------------------------- Chat ----------------------------------------
+message ChatRequest {
+  string session_id = 1;
+  string message = 2;
+  repeated string attachments = 3; // @file / @symbol references
+}
+
+message ChatMessage {
+  string role = 1;    // user | assistant | system
+  string content = 2;
+}
+
+// ----------------------------- Host service (Core -> Host) ----------------
+message ApplyEditRequest {
+  string document_uri = 1;
+  string old_text = 2;
+  string new_text = 3;
+}
+
+message GhostTextRequest {
+  string document_uri = 1;
+  int32 cursor_offset = 2;
+  string suggestion = 3;
+}
+
+message ReadDocumentRequest {
+  string document_uri = 1;
+}
+
+message ReadDocumentResponse {
+  string content = 1;
+}
+
+// ----------------------------- services ------------------------------------
+// Implemented by the Core. The host calls into these.
+service AgentService {
+  rpc Ping(Empty) returns (Pong);
+  rpc NesComplete(NesRequest) returns (stream NesSuggestion);
+  rpc RunAgent(AgentRequest) returns (stream AgentEvent);
+  rpc Chat(ChatRequest) returns (stream ChatMessage);
+}
+
+// Implemented by the host (Tauri shell / CLI). The Core calls these to drive
+// the UI. This is the boundary the HostBridge speaks across (T01/T02).
+service HostService {
+  rpc ApplyEdit(ApplyEditRequest) returns (Ack);
+  rpc ShowGhostText(GhostTextRequest) returns (Ack);
+  rpc ReadDocument(ReadDocumentRequest) returns (ReadDocumentResponse);
+}
+
+// ============================================================================
+// Health probe (T10 — private-deployment base).
+//
+// Appended MINIMALLY to respect the G6 contract freeze: a single read-only
+// readiness RPC is added without touching the frozen `AgentService`/`HostService`
+// definitions above. Orchestrators (docker-compose, k8s) probe Core readiness
+// over gRPC via `grpc_health_probe -addr=<core>:50051`.
+// ============================================================================
+enum HealthStatus {
+  UNKNOWN = 0;
+  SERVING = 1;
+  NOT_SERVING = 2;
+}
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  HealthStatus status = 1;
+  string detail = 2;
+}
+
+service HealthService {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}

@@ -1,0 +1,19 @@
+# ===== Rust build artifacts =====
+/target
+**/target
+
+# ===== Node / frontend =====
+node_modules
+gui/dist
+
+# ===== Tauri sidecars (built per-arch, NOT committed) =====
+gui/src-tauri/bin
+
+# ===== macOS build output =====
+gui/src-tauri/target
+
+# ===== OS / editor =====
+.DS_Store
+*.swp
+.idea
+.vscode

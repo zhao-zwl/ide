@@ -1,0 +1,21 @@
+[package]
+name = "ide-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
+# Keep default features (TLS + timeout builder) so the real Ollama client compiles;
+# `json` adds serde (de)serialization for the /api/generate payload.
+reqwest = { version = "0.12", features = ["json"] }
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+
+[features]
+default = []

@@ -1,0 +1,137 @@
+%% aidea 自包含 .dmg GUI — 类 / 接口图
+
+classDiagram
+    direction LR
+
+    %% ---------- Rust 端：全局状态 ----------
+    class AppState {
+        +clients: GrpcClients
+        +vendor: VendorConfig
+        +bootstrap: BootstrapHandles
+        +aborts: HashMap~String, CancellationToken~
+        +store: Store
+        +comment_store / secret_store / lock_store
+        +conn_status: Mutex~ConnStatus~
+    }
+    class VendorConfig {
+        +kind: "local"|"online"
+        +base_url: Option~String~
+        +local_model: String
+    }
+    class BootstrapHandles {
+        +pg: Child
+        +ollama: Child
+        +serve: Child
+        +phase: Mutex~BootstrapPhase~
+    }
+    class GrpcClients {
+        +agent: AgentServiceClient~Channel~
+        +health: HealthServiceClient~Channel~
+    }
+    class GuiError { +code: String +message: String }
+
+    %% ---------- Rust 端：Bootstrap / sidecar ----------
+    class Bootstrap {
+        +bootstrap_stack(cfg) BootstrapState
+        +stop_all()
+    }
+    class Sidecar {
+        +spawn(name, args, env) Child
+        +supervise(child)
+    }
+    class PgBoot {
+        +initdb_if_needed() +start() +createdb() +apply_migrations()
+    }
+    class OllamaBoot {
+        +start() +create_model("nes-tab", FROM qwen2.5:0.5b)
+    }
+    class ServeBoot {
+        +start_with_env(vendor) +wait_health()
+    }
+    class ModelBackend {
+        +to_serve_env(cfg) Vec~(String,String)~
+        +test_vendor(base_url, key) bool
+    }
+
+    %% ---------- Rust 端：Tauri Commands ----------
+    class Commands {
+        <<module>>
+        +bootstrap_status() BootstrapState
+        +get_vendor_config() VendorConfig
+        +set_vendor_config(cfg) void
+        +test_vendor(req) bool
+        +connect_status() ConnStatus
+        +chat_send/stop(req)
+        +agent_run(req)
+        +quest_run(req) QuestReport
+        +craft_propose/confirm/reject(req)
+        +comment_*/lock_*/secret_*
+        +fetch_health/console/metrics()
+    }
+
+    %% ---------- Rust 端：gRPC + 领域复用 ----------
+    class GrpcStream { +run_chat() +run_agent() }
+    class QuestService { +run(goal) QuestReport }
+    class CraftService { +propose()/confirm() }
+    class CollabService { +comment/lock/secret stores }
+
+    class IdeCore {
+        <<external: ide_core::v1>>
+        +AgentServiceClient / HealthServiceClient
+        +ChatRequest / ChatMessage / AgentRequest / AgentEvent
+    }
+    class IdeCoreDomain {
+        <<external: ide_core>>
+        +quest::Quest / craft::CraftEngine
+        +collab / security::PgSecretStore / CoreConfig
+    }
+
+    %% ---------- 前端 ----------
+    class ModelStore { +vendor +setVendor()/test() }
+    class ConnectionStore { +status +bootstrap }
+    class ChatStore { +sessions +send()/stop() }
+    class QuestStore { +history +run() }
+    class CraftStore { +proposal +confirm/reject }
+    class CollabStore { +comments/locks/secrets }
+    class HealthStore { +overview +fetch() }
+    class Pages {
+        <<module>>
+        +BootstrapPage +SettingsPage
+        +ChatPage +QuestPage +CraftPage +CollabPage +HealthPage
+    }
+    class InvokeApi { +invoke() +listen() }
+
+    %% ---------- 关系 ----------
+    AppState --> GrpcClients
+    AppState --> VendorConfig
+    AppState --> BootstrapHandles
+    Commands ..> AppState
+    Commands ..> Bootstrap
+    Commands ..> ModelBackend
+    Commands ..> GrpcStream
+    Commands ..> QuestService
+    Commands ..> CraftService
+    Commands ..> CollabService
+
+    Bootstrap ..> Sidecar
+    Bootstrap ..> PgBoot
+    Bootstrap ..> OllamaBoot
+    Bootstrap ..> ServeBoot
+    ModelBackend ..> ServeBoot : env
+    ServeBoot ..> IdeCore : 启动 aidea serve
+    GrpcClients ..> IdeCore
+    QuestService ..> IdeCoreDomain
+    CraftService ..> IdeCoreDomain
+    CollabService ..> IdeCoreDomain
+
+    Pages ..> InvokeApi
+    InvokeApi ..> Commands
+    Pages ..> BootstrapPage
+    Pages ..> SettingsPage
+    Pages ..> ChatStore
+    Pages ..> QuestStore
+    Pages ..> CraftStore
+    Pages ..> CollabStore
+    Pages ..> HealthStore
+    Pages ..> ModelStore
+    Pages ..> ConnectionStore

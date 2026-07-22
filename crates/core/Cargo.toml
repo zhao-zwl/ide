@@ -1,0 +1,48 @@
+[package]
+name = "ide-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+# T12 SSO — minimal HS256 shared-secret bearer verification. Deliberately
+# lightweight: only `hmac` + `sha2` + `base64` are added (no heavy HTTP / JWT
+# framework). OIDC RS256/JWKS is documented as a future extension only.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+# Postgres audit sink (T11) — append-only writes land in the 0001 `audit`
+# partition table. `runtime-tokio` + `with-serde_json-1` (for JSONB `detail`)
+# and no TLS impl (private deployment uses a trusted network / unix socket).
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-serde_json-1", "runtime"] }
+
+# NES probe (T04) — embedded so the Core can serve completion without a host.
+ide-probe = { path = "../probe" }
+# LLM backend 模块 (决策 #A): OllamaLlm / OpenAiLlm 通过 HTTP 调用本地 Ollama 与
+# OpenAI 兼容的 /v1/chat/completions。仅使用 json 特性，TLS 走默认实现。
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+# Dev-only: lets the v2.0 QA integration tests build an `AuditEvent` payload
+# (serde_json::Value) to assert the Rust<->SQL audit hash-chain normalization.
+# Already a normal dependency of the crate (compiled once); never ships in the binary.
+serde_json = "1"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[features]
+default = []

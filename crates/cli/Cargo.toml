@@ -1,0 +1,29 @@
+# `aidea` — Agentic IDE command line (T09, F8).
+#
+# The dual-form CLI shares the SAME decision Core as the desktop IDE, reached
+# through the `ide-core` library (no separate gRPC server required for
+# `chat`/`craft`/`nes`; `serve` starts the ProtoBus gRPC server). Only `clap` +
+# the existing `ide-core` library are pulled in — no new heavy dependencies.
+
+[package]
+name = "aidea"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aidea"
+path = "src/main.rs"
+
+[lib]
+name = "aidea"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+ide-core = { path = "../core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }

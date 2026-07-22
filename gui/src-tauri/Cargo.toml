@@ -1,0 +1,40 @@
+[package]
+name = "aidea-gui"
+version = "0.1.0"
+description = "aidea 自包含 macOS GUI 客户端"
+authors = ["aidea team"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Tauri v2 GUI：Rust 后端（WebView 桥接）+ 前端 React/Vite。
+# 复用 ide-core 生成的 gRPC 类型（ide_core::v1），不重复 build proto。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-store = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.11"
+prost = "0.12"
+futures-util = "0.3"
+tokio-util = "0.7"
+# 进程内复用 ide-core 的领域逻辑（quest / craft / collab / security / config）。
+ide-core = { path = "../../crates/core" }
+# macOS Keychain 存 API Key / DB 密码（密钥不落前端、不落 store）。
+keyring = "3"
+# FsHost 用 #[async_trait] 实现 HostProvider。
+async-trait = "0.1"
+# 在线厂商连通测试（GUI 侧探活 OpenAI 兼容 /v1/chat/completions）。
+reqwest = { version = "0.12", features = ["json"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# 默认关闭；通过 `NOTARIZE=1` 在 build-dmg.sh 中开启公证扩展点（需 Apple 证书）。
+default = []

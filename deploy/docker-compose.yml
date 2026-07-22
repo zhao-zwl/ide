@@ -1,0 +1,77 @@
+# ============================================================================
+# Agentic IDE — private (on-prem) deployment base (T10, F7).
+#
+# Single-tenant MVP validation: one logical tenant, data stays on-prem.
+# Three services: core (decision Core gRPC) + postgres+pgvector + ollama.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Then apply migrations once Postgres is healthy:
+#   psql "$AIDEA_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_init.sql
+#   psql "$AIDEA_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_v05.sql
+#
+# Health: Core exposes a gRPC HealthService (proto `HealthService.Check`);
+# `grpc_health_probe -addr=localhost:50051` is the canonical probe. The compose
+# healthcheck below uses it directly.
+# ============================================================================
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aidea
+      POSTGRES_PASSWORD: aidea
+      POSTGRES_DB: aidea
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aidea -d aidea"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollamadata:/root/.ollama
+    healthcheck:
+      # `ollama list` exits 0 once the daemon is up (empty list is fine).
+      test: ["CMD-SHELL", "ollama list || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      AIDEA_DATABASE_URL: postgres://aidea:aidea@postgres:5432/aidea
+      AIDEA_MODEL_ENDPOINT: http://ollama:11434
+      AIDEA_MODEL_NAME: nes-tab:latest
+      AIDEA_NES_BACKEND: ollama
+      AIDEA_SINGLE_TENANT: "true"
+      AIDEA_TENANT_ID: single
+      AIDEA_LOG_LEVEL: info
+      AIDEA_GRPC_ADDR: 0.0.0.0:50051
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./..:/workspace:ro
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+  ollamadata:

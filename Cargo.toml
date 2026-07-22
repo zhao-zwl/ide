@@ -1,0 +1,19 @@
+# Agentic IDE — M1 minimal runnable slice (v0.1 kernel verification).
+#
+# Cargo workspace. The decision Core (`ide-core`) and the NES probe (`ide-probe`)
+# are separate crates so the host-decoupled Core can embed the probe without
+# pulling in any IDE-specific dependency.
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/probe", "crates/cli", "gui/src-tauri"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/agentic-ide"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

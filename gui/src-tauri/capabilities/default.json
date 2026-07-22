@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "aidea GUI 默认权限白名单：前端通过 invoke 调 Rust 命令、listen 收事件、store 持久化非密钥配置。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "store:default"
+  ]
+}

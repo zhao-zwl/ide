@@ -1,0 +1,75 @@
+%% aidea 自包含 .dmg GUI — 程序调用流程时序图
+%% 覆盖：①首次启动拉起后端栈 ②Chat 本地 ③Chat 在线 ④模型后端切换 ⑤Quest/Comment ⑥健康概览(9090)
+
+sequenceDiagram
+    autonumber
+    participant UI as 前端 (React)
+    participant API as api/invoke.ts
+    participant BOOT as bootstrap (Rust)
+    participant PG as PostgreSQL (sidecar)
+    participant OLL as Ollama (sidecar)
+    participant SRV as aidea serve (sidecar, gRPC 50051)
+    participant EXT as 在线厂商 (OpenAI 兼容)
+    participant CORE as ide_core (进程内复用)
+
+    Note over UI,PG: === ① 首次启动拉起后端栈（失败重试） ===
+    UI->>API: 应用启动
+    API->>BOOT: bootstrap_stack(VendorConfig)
+    BOOT->>PG: initdb(AppData/pgdata) [首次] + pg_ctl start
+    PG-->>BOOT: 就绪
+    BOOT->>PG: createdb aidea + role + 应用 migrations/*.sql
+    BOOT->>OLL: ollama serve 启动
+    OLL-->>BOOT: 就绪
+    BOOT->>OLL: ollama create nes-tab (FROM qwen2.5:0.5b 本地权重)
+    OLL-->>BOOT: 模型就绪
+    BOOT->>SRV: aidea serve 127.0.0.1:50051 (env: LLM/NES backend, KEY)
+    loop 轮询 Health.Check
+        BOOT->>SRV: HealthService.Check
+        SRV-->>BOOT: SERVING
+    end
+    BOOT-->>API: emit("bootstrap-done")
+    API-->>UI: BootstrapPage → 进入主界面
+
+    Note over UI,SRV: === ② Chat（本地，后端路由 Ollama） ===
+    UI->>API: chat_send({session_id,message})
+    API->>SRV: AgentService.Chat (gRPC stream)
+    SRV->>OLL: /api/chat (nes-tab:latest)
+    OLL-->>SRV: tokens
+    SRV-->>API: emit("chat-token"×N) → emit("chat-done")
+    API-->>UI: 流式渲染
+
+    Note over UI,EXT: === ③ Chat（在线，Key 留后端） ===
+    UI->>API: chat_send({session_id,message})
+    API->>SRV: AgentService.Chat (gRPC stream)
+    Note right of SRV: serve 持 AIDEA_LLM_API_KEY，调 EXT
+    SRV->>EXT: POST {base_url}/v1/chat/completions (Bearer Key)
+    EXT-->>SRV: tokens
+    SRV-->>API: emit("chat-token"×N) → emit("chat-done")
+    API-->>UI: 流式渲染（前端不接触 Key）
+
+    Note over UI,SRV: === ④ 模型后端切换（重启 serve） ===
+    UI->>API: set_vendor_config({kind:"online",base_url})
+    API->>BOOT: 停旧 aidea serve
+    BOOT->>SRV: SIGTERM
+    BOOT->>SRV: 以新 env 重启 aidea serve (AIDEA_LLM_BACKEND=openai, KEY from keyring)
+    loop 轮询 Health.Check
+        BOOT->>SRV: Check
+    end
+    BOOT-->>API: emit("vendor-changed")
+    API-->>UI: 状态转绿
+
+    Note over UI,CORE: === ⑤ Quest / Comment（进程内 ide-core） ===
+    UI->>API: quest_run({goal})
+    API->>CORE: Quest::run(goal, CoreConfig)
+    CORE-->>API: QuestReport
+    API-->>UI: 列表+详情
+    UI->>API: comment_add({file,line,text})
+    API->>CORE: CommentStore.add (直连 bundled PG)
+    CORE-->>API: id
+    API-->>UI: 刷新
+
+    Note over UI,SRV: === ⑥ 健康概览（拉 9090，复用数据不内嵌） ===
+    UI->>API: fetch_health()
+    API->>SRV: GET :9090/healthz + /console
+    SRV-->>API: "ok\n" + 文本+--- json ---+JSON
+    API-->>UI: HealthOverview 渲染
