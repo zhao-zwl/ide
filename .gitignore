@@ -17,3 +17,6 @@ gui/src-tauri/target
 *.swp
 .idea
 .vscode
+
+# ===== 端模型权重（构建时烘焙进包，不进 git 仓库）=====
+*.gguf

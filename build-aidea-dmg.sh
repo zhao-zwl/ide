@@ -77,6 +77,35 @@ done
 log "6 个 sidecar 校验通过"
 
 # ---------------------------------------------------------------------------
+# 2.5) 烘焙端模型权重进包（离线可用）：pull qwen2.5:0.5b -> 导出本地 gguf
+#      权重随 .dmg 内置，首次启动无需联网即可 ollama create nes-tab。
+#      若 ollama 不可用或拉取失败，则降级为「首次启动联网拉取」模式（不阻断打包）。
+# ---------------------------------------------------------------------------
+log "==> [2.5/5] 烘焙端模型 qwen2.5:0.5b 权重进包（离线可用）"
+MODEL_DIR="$ROOT/gui/src-tauri/resources/models/nes-tab"
+GGUF="$MODEL_DIR/qwen2.5-0.5b.gguf"
+if [ -f "$GGUF" ]; then
+  log "权重已存在，跳过：$GGUF ($(du -h "$GGUF" 2>/dev/null | cut -f1))"
+else
+  OLLAMA_CMD="${OLLAMA_BIN:-$(command -v ollama || true)}"
+  if [ -z "$OLLAMA_CMD" ]; then
+    log "（跳过模型烘焙：未找到 ollama，包将为首次启动联网拉取模式）"
+  else
+    log "拉取 qwen2.5:0.5b ..."
+    "$OLLAMA_CMD" pull qwen2.5:0.5b > /tmp/ollama_pull.log 2>&1 \
+      || log "（ollama pull 失败，包将为首次启动联网拉取模式）"
+    # 从 ollama 模型仓库抽取单文件 GGUF 权重（qwen2.5:0.5b 为单一 gguf blob）
+    BLOB="$("$OLLAMA_CMD" show qwen2.5:0.5b --modelfile 2>/dev/null | grep -E '^FROM ' | awk '{print $2}')"
+    if [ -n "$BLOB" ] && [ -f "$BLOB" ]; then
+      cp "$BLOB" "$GGUF"
+      log "权重已烘焙进包：$GGUF ($(du -h "$GGUF" 2>/dev/null | cut -f1))"
+    else
+      log "（未找到权重 blob，包将为首次启动联网拉取模式）"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 3) 前端依赖安装与构建（dist 已存在可跳过，但 npm install 需拉 @tauri-apps/cli）
 # ---------------------------------------------------------------------------
 log "==> [3/5] 安装并构建前端"

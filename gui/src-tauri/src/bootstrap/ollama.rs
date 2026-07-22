@@ -1,5 +1,5 @@
 //! Ollama sidecar 编排：启动 `ollama serve` → 创建端模型 `nes-tab`
-//! （FROM 本地 qwen2.5:0.5b 权重，对齐 `model_name` 默认值 nes-tab:latest）。
+//! （FROM 随包内置的 qwen2.5:0.5b.gguf 权重，对齐 `model_name` 默认值 nes-tab:latest）。
 
 use crate::bootstrap::emit_progress;
 use crate::bootstrap::sidecar::{app_data_dir, bin_path, resource_path, spawn_binary};
@@ -58,8 +58,8 @@ async fn wait_ollama_ready() -> Result<(), GuiError> {
     Err(GuiError::bootstrap("Ollama 启动后超时未就绪"))
 }
 
-/// `ollama create nes-tab -f Modelfile`（FROM 本地 qwen2.5:0.5b）。
-/// 离线且无基础权重时创建会失败，这里容忍失败（serve 仍可启动，chat 不可用）。
+/// `ollama create nes-tab -f Modelfile`（FROM 随包内置的 qwen2.5:0.5b.gguf）。
+/// 权重已随 .dmg 内置，首次启动离线即可创建；若内置缺失则容忍失败（serve 仍可启动，chat 不可用）。
 fn create_nes_tab(app: &AppHandle, models_env: &str) -> Result<(), GuiError> {
     let bin = bin_path(app, "ollama");
     let modelfile = resource_path(app, "resources/models/nes-tab/Modelfile");
