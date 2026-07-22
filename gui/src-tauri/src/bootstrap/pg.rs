@@ -49,7 +49,7 @@ pub async fn init_and_start(app: &AppHandle) -> Result<(), GuiError> {
     // pg_ctl 会 fork 出 postgres 并退出；此处把 pg_ctl 句柄存下（监管用）。
     app.state::<AppState>().bootstrap.lock().unwrap().pg = Some(pg_ctl);
 
-    wait_pg_ready(app)?;
+    wait_pg_ready(app).await?;
     ensure_db_and_role(app)?;
     apply_migrations(app)?;
     emit_progress(app, BootstrapPhase::Pg, 0.35, Some("PostgreSQL 就绪"));
@@ -123,14 +123,14 @@ fn pg_ready(app: &AppHandle) -> bool {
     matches!(out, Ok(s) if s.success())
 }
 
-/// 等待 PG 就绪（轮询 SELECT 1）。
-fn wait_pg_ready(app: &AppHandle) -> Result<(), GuiError> {
+/// 等待 PG 就绪（轮询 SELECT 1，非阻塞）。
+async fn wait_pg_ready(app: &AppHandle) -> Result<(), GuiError> {
     let psql = bin_path(app, "psql");
     for _ in 0..60 {
         if pg_ready(app) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let _ = psql;
     Err(GuiError::bootstrap("PostgreSQL 启动后超时未就绪"))

@@ -47,7 +47,7 @@ pub async fn comment_add(app: &AppHandle, req: CommentAddRequest) -> GuiResult<C
         author,
         body: req.body,
         resolved: false,
-        created_at: 0,
+        created_at: comment.created_at,
     })
 }
 

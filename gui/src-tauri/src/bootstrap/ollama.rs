@@ -31,7 +31,7 @@ pub async fn start(app: &AppHandle) -> Result<(), GuiError> {
             &[("OLLAMA_MODELS".to_string(), models_env.clone())],
         )?;
         app.state::<AppState>().bootstrap.lock().unwrap().ollama = Some(child);
-        wait_ollama_ready()?;
+        wait_ollama_ready().await?;
         emit_progress(app, BootstrapPhase::Ollama, 0.5, Some("Ollama 就绪"));
     }
 
@@ -47,13 +47,13 @@ fn ollama_ready() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-/// 等待 Ollama 就绪（轮询端口）。
-fn wait_ollama_ready() -> Result<(), GuiError> {
+/// 等待 Ollama 就绪（轮询端口，非阻塞）。
+async fn wait_ollama_ready() -> Result<(), GuiError> {
     for _ in 0..60 {
         if ollama_ready() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(GuiError::bootstrap("Ollama 启动后超时未就绪"))
 }
