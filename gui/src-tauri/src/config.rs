@@ -35,9 +35,7 @@ pub fn load_vendor_config(app: &AppHandle) -> GuiResult<VendorConfig> {
 /// 将模型后端配置写入 store（不含任何密钥）。
 pub fn save_vendor_config(app: &AppHandle, cfg: &VendorConfig) -> GuiResult<()> {
     let store = app.store(STORE_FILE).map_err(|e| GuiError::vendor(e.to_string()))?;
-    store
-        .set("vendor", json!(cfg))
-        .map_err(|e| GuiError::vendor(e.to_string()))?;
+    store.set("vendor", json!(cfg));
     store.save().map_err(|e| GuiError::vendor(e.to_string()))?;
     Ok(())
 }
@@ -57,9 +55,7 @@ pub fn load_auto_bootstrap(app: &AppHandle) -> bool {
 /// 写入自动拉起开关。
 pub fn save_auto_bootstrap(app: &AppHandle, enabled: bool) -> GuiResult<()> {
     let store = app.store(STORE_FILE).map_err(|e| GuiError::vendor(e.to_string()))?;
-    store
-        .set("auto_bootstrap", json!(enabled))
-        .map_err(|e| GuiError::vendor(e.to_string()))?;
+    store.set("auto_bootstrap", json!(enabled));
     store.save().map_err(|e| GuiError::vendor(e.to_string()))?;
     Ok(())
 }
@@ -71,7 +67,7 @@ pub fn get_secret(key: &str) -> GuiResult<Option<String>> {
     match entry.get_password() {
         Ok(v) => Ok(Some(v)),
         // 条目不存在视为「未配置」，不是错误。
-        Err(keyring::Error::NoEntry) | Err(keyring::Error::NoStorageAccess) => Ok(None),
+        Err(keyring::Error::NoEntry) | Err(keyring::Error::NoStorageAccess(_)) => Ok(None),
         Err(e) => Err(GuiError::vendor(format!("keyring read error: {e}"))),
     }
 }

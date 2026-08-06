@@ -69,8 +69,8 @@ fn create_nes_tab(app: &AppHandle, models_env: &str) -> Result<(), GuiError> {
     let status = Command::new(&bin)
         .args(["create", "nes-tab", "-f", modelfile.to_str().unwrap()])
         .env("OLLAMA_MODELS", models_env)
-        .stdout(std::process::Stdio::null)
-        .stderr(std::process::Stdio::piped)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .status();
     match status {
         Ok(s) if s.success() => Ok(()),

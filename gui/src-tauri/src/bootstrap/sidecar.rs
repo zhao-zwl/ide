@@ -54,9 +54,9 @@ pub fn spawn_binary(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::null)
-        .stdout(Stdio::piped)
-        .stderr(Stdio::piped);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     cmd.spawn()
         .map_err(|e| GuiError::bootstrap(format!("拉起 {} 失败: {e}", bin.display())))
 }

@@ -68,8 +68,8 @@ fn run_initdb(initdb_bin: &PathBuf, pgdata: &PathBuf) -> Result<(), GuiError> {
             "UTF8",
             "--auth=trust",
         ])
-        .stdout(std::process::Stdio::null)
-        .stderr(std::process::Stdio::piped)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .status()
         .map_err(|e| GuiError::bootstrap(format!("initdb 执行失败: {e}")))?;
     if !status.success() {
@@ -95,8 +95,8 @@ fn spawn_pg_ctl(
             &format!("-p {PG_PORT} -c listen_addresses=127.0.0.1 -c unix_socket_directories={}", pgdata.to_str().unwrap()),
             "start",
         ])
-        .stdout(std::process::Stdio::null)
-        .stderr(std::process::Stdio::piped)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| GuiError::bootstrap(format!("pg_ctl 拉起失败: {e}")))?;
     Ok(child)
@@ -117,8 +117,8 @@ fn pg_ready(app: &AppHandle) -> bool {
             "-tAc", "SELECT 1",
         ])
         .env("PGPASSWORD", "aidea")
-        .stdout(std::process::Stdio::null)
-        .stderr(std::process::Stdio::null)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     matches!(out, Ok(s) if s.success())
 }
@@ -149,8 +149,8 @@ fn ensure_db_and_role(app: &AppHandle) -> Result<(), GuiError> {
             "-c", "CREATE DATABASE aidea;",
         ])
         .env("PGPASSWORD", "aidea")
-        .stdout(std::process::Stdio::null)
-        .stderr(std::process::Stdio::null)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     Ok(())
 }
@@ -184,8 +184,8 @@ fn apply_migrations(app: &AppHandle) -> Result<(), GuiError> {
                 f.to_str().unwrap(),
             ])
             .env("PGPASSWORD", "aidea")
-            .stdout(std::process::Stdio::null)
-            .stderr(std::process::Stdio::piped)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .status();
         match status {
             Ok(s) if s.success() => {

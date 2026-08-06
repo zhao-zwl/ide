@@ -5,7 +5,6 @@
 //! 透传的语义一致（`code` 字段）。
 
 use serde::Serialize;
-use serde_json::json;
 
 /// GUI 层错误：结构化 `{ code, message }`。
 #[derive(Debug, Clone, Serialize)]
@@ -46,14 +45,11 @@ impl From<GuiError> for String {
     }
 }
 
-/// Tauri v2 命令错误必须可转为 `InvokeError`；优先以结构化 JSON 返回
-/// `{ code, message }`，便于前端程序化读取错误类别。
-impl From<GuiError> for tauri::ipc::InvokeError {
-    fn from(e: GuiError) -> Self {
-        tauri::ipc::InvokeError::from_serde(json!({ "code": e.code, "message": e.message }))
-            .unwrap_or_else(|_| tauri::ipc::InvokeError::from(e.to_string()))
-    }
-}
+/// Tauri v2 命令返回 `Result<T, GuiError>` 时，框架的 blanket
+/// `impl<T: Serialize> From<T> for tauri::ipc::InvokeError` 会把可序列化的
+/// `GuiError` 直接序列化为 `{ "code": ..., "message": ... }` 交前端处理，
+/// 因此无需（也不能）再手写 `From<GuiError> for InvokeError`（会与 blanket
+/// impl 冲突，E0119）。`GuiError` 已派生 `Serialize`。
 
 /// GUI 命令统一返回类型。
 pub type GuiResult<T> = Result<T, GuiError>;

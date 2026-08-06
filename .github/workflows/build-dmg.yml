@@ -1,48 +1,539 @@
-name: Build aidea .dmg
+name: Build aidea macOS bundle (cross-compile)
 
-# 在 GitHub 托管的 macOS runner 上构建自包含 aidea .dmg。
-# 选 macos-13（Intel x86_64）以匹配用户机器 triple = x86_64-apple-darwin；
-# 若你的目标机是 Apple Silicon，请把 runs-on 改成 macos-14 / macos-latest（arm64）。
+# =============================================================================
+# 在 GitHub 免费的 Linux runner（ubuntu-latest，无需绑卡）上：
+#   1. 用 osxcross 把 Rust 代码交叉编译成 x86_64-apple-darwin 原生二进制
+#   2. 用 vite 构建前端
+#   3. 下载 ollama / PostgreSQL 的 macOS 预编译二进制（含其 dylib 与 share 数据）
+#   4. 打成一个 aidea-bundle.tar.gz Artifact
 #
-# 触发：push 到 main/master，或在 Actions 页手动 Run workflow。
-# 产物：Workflow 运行结束后在 Artifacts 区下载 aidea-dmg（含 .dmg）。
+# 【故意不做的事】不在这里跑 `tauri build`。
+#   Linux 无法生成 macOS 的 .app/.dmg（需要 hdiutil/codesign），
+#   所以封包这一步交给用户在本机 macOS 上跑仓库根的 `package-dmg.sh`。
+#   用户本机的 Spotlight(mds) 已损坏导致 cargo 死锁，但 hdiutil/codesign 不依赖 mds。
+#
+# 产物：Actions 运行结束后在 Artifacts 区下载 `aidea-bundle`。
+# =============================================================================
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      bake_model:
+        description: "把 qwen2.5-0.5b.gguf 端模型权重烘焙进包（离线可用，artifact 约 +400MB）"
+        type: boolean
+        default: true
+      osxcross_tag:
+        description: "crazymax/osxcross 镜像 tag（提供 MacOSX SDK + cctools/ld64）"
+        type: string
+        default: "14.5-r0-ubuntu"
   push:
     branches: [main, master]
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET_TRIPLE: x86_64-apple-darwin
+  MACOSX_DEPLOYMENT_TARGET: "10.15"
+  PG_MAJOR: "17"
+  OSXCROSS_ROOT: /opt/osxcross
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
 jobs:
-  build-dmg:
-    runs-on: macos-13
+  build-bundle:
+    name: Cross-compile macOS bundle on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
+      # -------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust (x86_64-apple-darwin)
+      # -------------------------------------------------------------------
+      # 磁盘：osxcross SDK(~2G) + cargo target(~6G) + pg/ollama/gguf(~1G)
+      # -------------------------------------------------------------------
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/nonexistent}" || true
+          sudo apt-get clean || true
+          echo "after:"; df -h / | tail -1
+
+      # -------------------------------------------------------------------
+      - name: Install host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # clang/lld/libc6-dev : osxcross 工具链的宿主依赖
+          # protobuf-compiler   : crates/core 的 build.rs 用 tonic-build，需要 protoc（跑在宿主）
+          # 7zip / p7zip-full   : 解 Postgres.app 的 .dmg（7zz 支持 APFS，7z 兜底 HFS+）
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm libc6-dev \
+            protobuf-compiler pkg-config cmake \
+            curl jq xz-utils zstd rsync \
+            7zip p7zip-full libxml2 zlib1g-dev
+          protoc --version
+
+      # -------------------------------------------------------------------
+      - name: Install Rust toolchain (+ x86_64-apple-darwin target)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
 
-      - name: Setup Node.js
+      # Swatinem/rust-cache 会自动裁剪 target/ 中的中间产物，避免撑爆 10GB 仓库缓存配额
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-darwin-cross
+          key: ${{ env.TARGET_TRIPLE }}
+          cache-on-failure: true
+
+      # -------------------------------------------------------------------
+      # osxcross：从 crazymax/osxcross 镜像里拷出整套工具链（含 MacOSX SDK）。
+      # 该镜像 linux/amd64 变体把工具链放在 /osxcross（bin/ lib/ SDK/），
+      # 部分变体把 SDK 单独放在 /osxsdk —— 两种都兼容处理。
+      # -------------------------------------------------------------------
+      - name: Fetch osxcross toolchain (MacOSX SDK + cctools/ld64)
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.osxcross_tag || '14.5-r0-ubuntu' }}"
+          IMAGE="crazymax/osxcross:${TAG}"
+          echo "pulling ${IMAGE}"
+          docker pull --platform linux/amd64 "$IMAGE"
+
+          CID="$(docker create --platform linux/amd64 "$IMAGE")"
+          sudo mkdir -p "$OSXCROSS_ROOT"
+          sudo chown -R "$(id -u):$(id -g)" "$OSXCROSS_ROOT"
+          docker cp "$CID:/osxcross/." "$OSXCROSS_ROOT/"
+
+          # SDK 可能不在 /osxcross/SDK 而在 /osxsdk
+          if ! ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
+            mkdir -p "$OSXCROSS_ROOT/SDK"
+            docker cp "$CID:/osxsdk/." "$OSXCROSS_ROOT/SDK/" || true
+          fi
+          docker rm -f "$CID" >/dev/null
+
+          echo "--- osxcross/bin (head) ---"
+          ls "$OSXCROSS_ROOT/bin" | head -40
+          echo "--- SDK ---"
+          ls -d "$OSXCROSS_ROOT"/SDK/* || true
+
+      # -------------------------------------------------------------------
+      - name: Configure cross-compilation environment
+        run: |
+          set -euo pipefail
+
+          SDK_DIR="$(ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$SDK_DIR" ]; then
+            echo "::error::osxcross 镜像里找不到 MacOSX SDK（期望 $OSXCROSS_ROOT/SDK/MacOSX*.sdk）"
+            exit 1
+          fi
+
+          # osxcross 的归档/工具带 darwin 版本前缀，如 x86_64-apple-darwin23.5-ar
+          AR_BIN="$(ls "$OSXCROSS_ROOT"/bin/x86_64-apple-darwin*-ar 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$AR_BIN" ]; then
+            echo "::error::osxcross 缺少 x86_64-apple-darwin*-ar"
+            exit 1
+          fi
+          PREFIX="${AR_BIN%-ar}"
+
+          # o64-clang / o64-clang++ 是版本无关的包装器，已内置 -arch x86_64 与 sysroot
+          CLANG="$OSXCROSS_ROOT/bin/o64-clang"
+          CLANGXX="$OSXCROSS_ROOT/bin/o64-clang++"
+          [ -x "$CLANG" ]   || CLANG="${PREFIX}-clang"
+          [ -x "$CLANGXX" ] || CLANGXX="${PREFIX}-clang++"
+
+          echo "$OSXCROSS_ROOT/bin" >> "$GITHUB_PATH"
+          {
+            echo "LD_LIBRARY_PATH=$OSXCROSS_ROOT/lib:${LD_LIBRARY_PATH:-}"
+            echo "SDKROOT=$SDK_DIR"
+            echo "OSXCROSS_SDK=$SDK_DIR"
+            echo "OSXCROSS_PREFIX=$PREFIX"
+            echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+            # cc / cmake crates 走 target 专属变量，避免污染宿主编译
+            echo "CC_x86_64_apple_darwin=$CLANG"
+            echo "CXX_x86_64_apple_darwin=$CLANGXX"
+            echo "AR_x86_64_apple_darwin=${PREFIX}-ar"
+            echo "RANLIB_x86_64_apple_darwin=${PREFIX}-ranlib"
+            echo "STRIP_x86_64_apple_darwin=${PREFIX}-strip"
+            echo "CFLAGS_x86_64_apple_darwin=-isysroot $SDK_DIR -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+            echo "CXXFLAGS_x86_64_apple_darwin=-isysroot $SDK_DIR -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"
+            # cargo 链接器
+            echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=$CLANG"
+            echo "CARGO_TARGET_X86_64_APPLE_DARWIN_AR=${PREFIX}-ar"
+            # 少数 crate（ring 等）只认无后缀的 TARGET_* 变量
+            echo "TARGET_CC=$CLANG"
+            echo "TARGET_CXX=$CLANGXX"
+            echo "TARGET_AR=${PREFIX}-ar"
+            echo "LIBZ_SYS_STATIC=1"
+          } >> "$GITHUB_ENV"
+
+          echo "SDKROOT = $SDK_DIR"
+          echo "PREFIX  = $PREFIX"
+          "$CLANG" --version || true
+
+      - name: Smoke-test osxcross (compile a trivial macOS binary)
+        run: |
+          set -euo pipefail
+          printf 'int main(void){return 0;}\n' > /tmp/probe.c
+          "$CC_x86_64_apple_darwin" /tmp/probe.c -o /tmp/probe.macho
+          file /tmp/probe.macho
+          file /tmp/probe.macho | grep -qi "Mach-O" \
+            || { echo "::error::osxcross 未产出 Mach-O，交叉工具链不可用"; exit 1; }
+
+      # -------------------------------------------------------------------
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
 
-      - name: Install system deps (ollama, postgresql@17)
+      - name: Build frontend (vite -> gui/dist)
+        working-directory: gui
         run: |
-          brew update
-          brew install ollama postgresql@17
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+          npm run build
+          echo "--- gui/dist ---"
+          find dist -type f | head -40
+          [ -f dist/index.html ] || { echo "::error::前端构建未产出 dist/index.html"; exit 1; }
 
-      - name: Build aidea dmg (one-shot)
-        run: bash build-aidea-dmg.sh
-        env:
-          # 减小调试信息体积，避免 runner 磁盘打满
-          CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # -------------------------------------------------------------------
+      # 先放 sidecar 占位文件：tauri-build 在编译期会校验 externalBin 是否存在。
+      # 真实二进制会在后续步骤覆盖它们。
+      # -------------------------------------------------------------------
+      - name: Create sidecar placeholders (satisfy tauri-build externalBin check)
+        run: |
+          set -euo pipefail
+          mkdir -p gui/src-tauri/bin
+          for n in aidea ollama postgres initdb pg_ctl psql; do
+            f="gui/src-tauri/bin/${n}-${TARGET_TRIPLE}"
+            [ -s "$f" ] || printf '#!/bin/sh\nexit 0\n' > "$f"
+            chmod +x "$f"
+          done
+          ls -la gui/src-tauri/bin
 
-      - name: Upload .dmg artifact
+      # -------------------------------------------------------------------
+      - name: Download ollama macOS binary
+        run: |
+          set -euo pipefail
+          mkdir -p .bundle/bin .bundle/lib
+          WORK="$(mktemp -d)"
+
+          API="https://api.github.com/repos/ollama/ollama/releases/latest"
+          ASSETS="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" || echo '{}')"
+          # 优先单文件 ollama-darwin，其次 ollama-darwin.tgz（内含 bin/ollama + lib/ollama runner）
+          URL="$(echo "$ASSETS" | jq -r '[.assets[]?|select(.name=="ollama-darwin")|.browser_download_url][0] // empty')"
+          TGZ="$(echo "$ASSETS" | jq -r '[.assets[]?|select(.name=="ollama-darwin.tgz")|.browser_download_url][0] // empty')"
+
+          got=0
+          if [ -n "$URL" ]; then
+            echo "downloading single-file: $URL"
+            if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama" "$URL"; then
+              cp "$WORK/ollama" ".bundle/bin/ollama-${TARGET_TRIPLE}"
+              got=1
+            fi
+          fi
+          if [ "$got" != 1 ] && [ -n "$TGZ" ]; then
+            echo "downloading tarball: $TGZ"
+            if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama.tgz" "$TGZ"; then
+              mkdir -p "$WORK/x" && tar -xzf "$WORK/ollama.tgz" -C "$WORK/x"
+              BIN="$(find "$WORK/x" -type f -name ollama | head -1 || true)"
+              if [ -n "$BIN" ]; then
+                cp "$BIN" ".bundle/bin/ollama-${TARGET_TRIPLE}"
+                got=1
+                # ollama 按 <exe>/../lib/ollama 查找 runner，原样保留该目录
+                LIBDIR="$(find "$WORK/x" -type d -name ollama -path '*/lib/*' | head -1 || true)"
+                if [ -n "$LIBDIR" ]; then
+                  mkdir -p .bundle/lib/ollama
+                  rsync -a "$LIBDIR/" .bundle/lib/ollama/
+                  echo "bundled ollama runners: $(du -sh .bundle/lib/ollama | cut -f1)"
+                fi
+              fi
+            fi
+          fi
+
+          if [ "$got" = 1 ]; then
+            chmod +x ".bundle/bin/ollama-${TARGET_TRIPLE}"
+            file ".bundle/bin/ollama-${TARGET_TRIPLE}" || true
+          else
+            echo "::warning::ollama macOS 二进制获取失败，包内将缺少 ollama（端模型对话不可用，在线厂商仍可用）"
+          fi
+          rm -rf "$WORK"
+
+      # -------------------------------------------------------------------
+      # PostgreSQL：取 Postgres.app 的 macOS 构建。
+      # 关键点：它的 bin 里的可执行文件用 @loader_path/../lib 引用 dylib，
+      # 并按 <exe>/../share 找 initdb 模板，所以必须连 lib/ 与 share/ 一起打包，
+      # 且在 .app 内保持 bin / lib / share 同级（都放 Contents/Resources 下）。
+      #
+      # 备选源（若 Postgres.app 下载不稳）：
+      #   * https://get.enterprisedb.com/postgresql/postgresql-17.x-1-osx-binaries.zip
+      #   * https://github.com/theseus-rs/postgresql-binaries/releases (x86_64-apple-darwin tar.gz)
+      # -------------------------------------------------------------------
+      - name: Download & extract PostgreSQL macOS binaries (Postgres.app)
+        run: |
+          set -euo pipefail
+          mkdir -p .bundle/bin .bundle/lib .bundle/share
+          WORK="$(mktemp -d)"
+
+          API="https://api.github.com/repos/PostgresApp/PostgresApp/releases/latest"
+          DMG_URL="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" \
+            | jq -r --arg v "-${PG_MAJOR}.dmg" \
+                '[.assets[]?|select(.name|endswith($v))|.browser_download_url][0] // empty' || true)"
+          if [ -z "$DMG_URL" ]; then
+            echo "::warning::未从 API 解析到 Postgres-*-${PG_MAJOR}.dmg，回退到已知版本"
+            DMG_URL="https://github.com/PostgresApp/PostgresApp/releases/download/v2.9.5/Postgres-2.9.5-17.dmg"
+          fi
+          echo "postgres dmg: $DMG_URL"
+
+          if ! curl -fL --retry 3 --retry-delay 5 -o "$WORK/pg.dmg" "$DMG_URL"; then
+            echo "::warning::Postgres.app 下载失败，包内将缺少 postgres（GUI 会在启动阶段报数据库不可用）"
+            rm -rf "$WORK"; exit 0
+          fi
+
+          extract() {  # $1=archive $2=outdir
+            if command -v 7zz >/dev/null 2>&1 && 7zz x -y -o"$2" "$1" >/dev/null 2>&1; then return 0; fi
+            if command -v 7z  >/dev/null 2>&1 && 7z  x -y -o"$2" "$1" >/dev/null 2>&1; then return 0; fi
+            return 1
+          }
+
+          mkdir -p "$WORK/x1"
+          extract "$WORK/pg.dmg" "$WORK/x1" || echo "第一层解包返回非零（常见，继续找内层分区）"
+          PGBIN="$(find "$WORK/x1" -type d -path "*/Versions/${PG_MAJOR}/bin" | head -1 || true)"
+
+          # dmg 内层通常是一个 HFS+/APFS 分区镜像，需要再解一层
+          if [ -z "$PGBIN" ]; then
+            IMG="$(find "$WORK/x1" -maxdepth 2 -type f \( -name '*.hfs' -o -name '*.hfsx' -o -name '*.apfs' -o -name '*.img' -o -name '*.dmg' \) | head -1 || true)"
+            if [ -n "$IMG" ]; then
+              mkdir -p "$WORK/x2"
+              extract "$IMG" "$WORK/x2" || true
+              PGBIN="$(find "$WORK/x2" -type d -path "*/Versions/${PG_MAJOR}/bin" | head -1 || true)"
+            fi
+          fi
+
+          if [ -z "$PGBIN" ]; then
+            echo "::warning::未能从 dmg 中提取 Postgres.app/Contents/Versions/${PG_MAJOR}/bin"
+            find "$WORK" -maxdepth 4 -type d | head -40
+            rm -rf "$WORK"; exit 0
+          fi
+
+          PGROOT="$(dirname "$PGBIN")"
+          echo "postgres root: $PGROOT"
+
+          # 4 个 sidecar 按 Tauri 约定带 triple 后缀
+          for tool in postgres initdb pg_ctl psql; do
+            if [ -f "$PGBIN/$tool" ]; then
+              cp "$PGBIN/$tool" ".bundle/bin/${tool}-${TARGET_TRIPLE}"
+              chmod +x ".bundle/bin/${tool}-${TARGET_TRIPLE}"
+              echo "  + $tool"
+            else
+              echo "::warning::Postgres.app 内缺少 $tool"
+            fi
+          done
+          # initdb 会 exec `postgres --boot`，pg_ctl 会 exec `postgres`；顺带带上常用辅助工具
+          for extra in pg_controldata pg_resetwal pg_isready pg_dump pg_restore; do
+            if [ -f "$PGBIN/$extra" ]; then cp "$PGBIN/$extra" ".bundle/bin/$extra"; fi
+          done
+
+          # 运行时依赖：dylib 与 share 数据
+          if [ -d "$PGROOT/lib" ];   then rsync -a "$PGROOT/lib/"   .bundle/lib/;   else echo "::warning::Postgres.app 无 lib/"; fi
+          if [ -d "$PGROOT/share" ]; then rsync -a "$PGROOT/share/" .bundle/share/; else echo "::warning::Postgres.app 无 share/"; fi
+
+          echo "bundled lib:   $(du -sh .bundle/lib   2>/dev/null | cut -f1)"
+          echo "bundled share: $(du -sh .bundle/share 2>/dev/null | cut -f1)"
+          rm -rf "$WORK"
+
+      # -------------------------------------------------------------------
+      - name: Bake on-device model weights (optional, best-effort)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.bake_model }}
+        run: |
+          set -euo pipefail
+          DST="gui/src-tauri/resources/models/nes-tab/qwen2.5-0.5b.gguf"
+          mkdir -p "$(dirname "$DST")"
+          if [ -f "$DST" ]; then echo "已存在，跳过"; exit 0; fi
+
+          # Modelfile 里写的是 `FROM ./qwen2.5-0.5b.gguf`，必须与 Modelfile 同目录同名
+          URLS="
+          https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          https://hf-mirror.com/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+          "
+          ok=0
+          for u in $URLS; do
+            echo "try: $u"
+            if curl -fL --retry 2 --retry-delay 5 --max-time 900 -o "$DST.part" "$u"; then
+              # GGUF 魔数校验，避免把 HTML 错误页当成权重打进包
+              if head -c 4 "$DST.part" | grep -q "GGUF"; then
+                mv "$DST.part" "$DST"; ok=1; break
+              fi
+              echo "下载内容不是 GGUF，丢弃"
+            fi
+            rm -f "$DST.part"
+          done
+          if [ "$ok" = 1 ]; then
+            echo "端模型权重已烘焙：$(du -h "$DST" | cut -f1)"
+          else
+            echo "::warning::端模型权重下载失败，包将退化为「首次启动联网让 ollama 拉取」模式"
+          fi
+
+      # -------------------------------------------------------------------
+      - name: Cross-compile Rust (aidea + aidea-gui) for x86_64-apple-darwin
+        run: |
+          set -euo pipefail
+          build() {
+            cargo build --release --target "$TARGET_TRIPLE" -p aidea -p aidea-gui
+          }
+          echo "::group::attempt 1 (repo release profile: lto=true, codegen-units=1)"
+          if build 2>&1 | tee /tmp/cargo1.log; then
+            echo "ok"
+          else
+            echo "::endgroup::"
+            echo "::warning::带 LTO 的构建失败（runner 常见 OOM），关闭 LTO 重试"
+            echo "::group::attempt 2 (lto=off, codegen-units=256)"
+            CARGO_PROFILE_RELEASE_LTO=false \
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
+            CARGO_PROFILE_RELEASE_INCREMENTAL=false \
+              build 2>&1 | tee /tmp/cargo2.log
+          fi
+          echo "::endgroup::"
+
+          # workspace 统一输出到仓库根 target/；兼容 gui/src-tauri/target/ 布局
+          OUT=""
+          for d in "target/${TARGET_TRIPLE}/release" "gui/src-tauri/target/${TARGET_TRIPLE}/release"; do
+            if [ -f "$d/aidea-gui" ]; then OUT="$d"; break; fi
+          done
+          [ -n "$OUT" ] || { echo "::error::未找到 aidea-gui 产物"; find . -name 'aidea-gui' -type f | head; exit 1; }
+          echo "CARGO_OUT_DIR=$OUT" >> "$GITHUB_ENV"
+
+          file "$OUT/aidea-gui" "$OUT/aidea"
+          file "$OUT/aidea-gui" | grep -qi "Mach-O 64-bit x86_64" \
+            || echo "::warning::aidea-gui 不是预期的 Mach-O x86_64（请核对 file 输出）"
+
+      - name: Upload cargo logs on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: aidea-dmg
-          path: gui/src-tauri/target/release/bundle/dmg/*.dmg
+          name: cargo-logs
+          path: |
+            /tmp/cargo1.log
+            /tmp/cargo2.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # -------------------------------------------------------------------
+      - name: Assemble bundle payload
+        run: |
+          set -euo pipefail
+          OUT="${CARGO_OUT_DIR}"
+          STAGE="dist-bundle"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/payload/macos" "$STAGE/payload/bin" \
+                   "$STAGE/payload/lib" "$STAGE/payload/share" "$STAGE/payload/icons"
+
+          # ① 主二进制
+          cp "$OUT/aidea-gui" "$STAGE/payload/macos/aidea-gui"
+          chmod +x "$STAGE/payload/macos/aidea-gui"
+
+          # ② sidecar：aidea 来自本次交叉编译；其余来自 .bundle/bin
+          cp "$OUT/aidea" "$STAGE/payload/bin/aidea-${TARGET_TRIPLE}"
+          if [ -d .bundle/bin ]; then cp -a .bundle/bin/. "$STAGE/payload/bin/"; fi
+          chmod +x "$STAGE"/payload/bin/* 2>/dev/null || true
+
+          # ③ 运行时依赖（postgres dylib / share，ollama runner）
+          if [ -d .bundle/lib ];   then cp -a .bundle/lib/.   "$STAGE/payload/lib/";   fi
+          if [ -d .bundle/share ]; then cp -a .bundle/share/. "$STAGE/payload/share/"; fi
+
+          # ④ 前端 + Tauri 资源 + 图标
+          cp -a gui/dist "$STAGE/payload/dist"
+          cp -a gui/src-tauri/resources "$STAGE/payload/resources"
+          if [ -f gui/src-tauri/icons/icon.png ]; then
+            cp gui/src-tauri/icons/icon.png "$STAGE/payload/icons/icon.png"
+          fi
+
+          # ⑤ Info.plist 模板（package-dmg.sh 优先使用它，缺失时自行生成等价内容）
+          cat > "$STAGE/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleName</key><string>aidea</string>
+          	<key>CFBundleDisplayName</key><string>aidea</string>
+          	<key>CFBundleIdentifier</key><string>com.aidea.gui</string>
+          	<key>CFBundleExecutable</key><string>aidea-gui</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          	<key>CFBundleVersion</key><string>0.1.0</string>
+          	<key>CFBundleShortVersionString</key><string>0.1.0</string>
+          	<key>CFBundleIconFile</key><string>icon.icns</string>
+          	<key>LSMinimumSystemVersion</key><string>10.15</string>
+          	<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+          	<key>NSHighResolutionCapable</key><true/>
+          	<key>NSPrincipalClass</key><string>NSApplication</string>
+          	<key>CFBundleSupportedPlatforms</key>
+          	<array><string>MacOSX</string></array>
+          	<key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+          	<key>NSAppTransportSecurity</key>
+          	<dict><key>NSAllowsLocalNetworking</key><true/></dict>
+          </dict>
+          </plist>
+          PLIST
+
+          # ⑥ 本机封包脚本 + 说明，随包一起发出，解包即用
+          cp package-dmg.sh "$STAGE/package-dmg.sh"
+          chmod +x "$STAGE/package-dmg.sh"
+          if [ -f DMG_BUILD.md ]; then cp DMG_BUILD.md "$STAGE/DMG_BUILD.md"; fi
+
+          # ⑦ 清单
+          {
+            echo "aidea macOS bundle"
+            echo "built_at   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit     : ${GITHUB_SHA:-unknown}"
+            echo "run        : ${GITHUB_RUN_ID:-unknown}"
+            echo "triple     : ${TARGET_TRIPLE}"
+            echo "min_macos  : ${MACOSX_DEPLOYMENT_TARGET}"
+            echo "sdk        : $(basename "${SDKROOT:-unknown}")"
+            echo "pg_major   : ${PG_MAJOR}"
+            if [ -f "$STAGE/payload/resources/models/nes-tab/qwen2.5-0.5b.gguf" ]; then
+              echo "model_gguf : bundled (offline ready)"
+            else
+              echo "model_gguf : absent (first-run online pull)"
+            fi
+          } > "$STAGE/MANIFEST.txt"
+          cat "$STAGE/MANIFEST.txt"
+
+          echo "--- payload tree (depth 3) ---"
+          find "$STAGE" -maxdepth 3 | sort | head -60
+
+          tar -czf aidea-bundle.tar.gz -C "$STAGE" .
+          ls -lh aidea-bundle.tar.gz
+
+      # -------------------------------------------------------------------
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aidea-bundle
+          path: aidea-bundle.tar.gz
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Next steps
+        run: |
+          echo "下载 Artifact「aidea-bundle」并解压得到 aidea-bundle.tar.gz，然后在本机 macOS 执行："
+          echo "    bash package-dmg.sh aidea-bundle.tar.gz"
+          echo "即可在当前目录得到 aidea.dmg（全程只用 hdiutil/codesign，不触发 Spotlight/mds）。"
