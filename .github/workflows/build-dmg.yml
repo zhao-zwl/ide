@@ -101,27 +101,139 @@ jobs:
       # osxcross：从 crazymax/osxcross 镜像里拷出整套工具链（含 MacOSX SDK）。
       # 该镜像 linux/amd64 变体把工具链放在 /osxcross（bin/ lib/ SDK/），
       # 部分变体把 SDK 单独放在 /osxsdk —— 两种都兼容处理。
+      #
+      # 【为什么要加固】历史上这一步在 CI 卡死 48 分钟、日志零输出。
+      #   tag 本身是有效的（14.5-r0-ubuntu 的 linux/amd64 manifest 存在，
+      #   压缩层约 205MB），所以不是「拉了个不存在的 tag」。
+      #   真正的坑是：GitHub runner 走共享出口 IP 匿名拉 Docker Hub，
+      #   一旦触发 429 限流，dockerd 会静默指数退避重试 —— 既不报错也不
+      #   打印新进度，一路挂到 job 的 120 分钟超时为止。
+      #
+      # 【三层加固】
+      #   1) 镜像源优先 GHCR（公共包无匿名拉取限流，且与 runner 同网），
+      #      Docker Hub 只作最后兜底；
+      #   2) 每次尝试整体包在 `timeout 600` 里 —— 卡住就快速失败而不是干等，
+      #      最多 3 次尝试（间隔递增 sleep），总耗时上界 ~31 分钟；
+      #   3) 解好的工具链用 actions/cache 按 tag 缓存，后续 run 秒级命中，
+      #      完全不碰 registry。
       # -------------------------------------------------------------------
-      - name: Fetch osxcross toolchain (MacOSX SDK + cctools/ld64)
+      - name: Resolve osxcross tag
+        id: osxcross
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.osxcross_tag || '14.5-r0-ubuntu' }}"
-          IMAGE="crazymax/osxcross:${TAG}"
-          echo "pulling ${IMAGE}"
-          docker pull --platform linux/amd64 "$IMAGE"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "osxcross tag = ${TAG}"
 
-          CID="$(docker create --platform linux/amd64 "$IMAGE")"
+      # actions/cache 以 runner 用户身份读写 /opt/osxcross，
+      # 必须先把目录建好并交出属主，否则 restore/save 会因权限失败。
+      - name: Prepare osxcross directory
+        run: |
+          set -euo pipefail
           sudo mkdir -p "$OSXCROSS_ROOT"
           sudo chown -R "$(id -u):$(id -g)" "$OSXCROSS_ROOT"
-          docker cp "$CID:/osxcross/." "$OSXCROSS_ROOT/"
 
-          # SDK 可能不在 /osxcross/SDK 而在 /osxsdk
-          if ! ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
-            mkdir -p "$OSXCROSS_ROOT/SDK"
-            docker cp "$CID:/osxsdk/." "$OSXCROSS_ROOT/SDK/" || true
+      - name: Cache osxcross toolchain
+        id: osxcross-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/osxcross
+          key: osxcross-${{ runner.os }}-${{ steps.osxcross.outputs.tag }}-v1
+
+      - name: Fetch osxcross toolchain (MacOSX SDK + cctools/ld64)
+        if: steps.osxcross-cache.outputs.cache-hit != 'true'
+        env:
+          OSXCROSS_TAG: ${{ steps.osxcross.outputs.tag }}
+        run: |
+          # 注意：这里故意不开 `-e`，重试循环需要自己判断每次尝试的退出码。
+          set -uo pipefail
+
+          echo "disk before: $(df -h / | tail -1)"
+
+          # 单次尝试：pull -> create -> cp -> 校验。任何一步失败都返回非 0。
+          fetch_once() {
+            local image="$1"
+            local cid=""
+            local rc=0
+
+            echo "--- docker pull ${image} ---"
+            docker pull --platform linux/amd64 "$image" || return 1
+
+            cid="$(docker create --platform linux/amd64 "$image")" || return 1
+
+            mkdir -p "$OSXCROSS_ROOT"
+            echo "--- docker cp ${cid}:/osxcross/. -> ${OSXCROSS_ROOT}/ ---"
+            docker cp "${cid}:/osxcross/." "$OSXCROSS_ROOT/" || rc=1
+
+            # SDK 可能不在 /osxcross/SDK 而在 /osxsdk
+            if [ "$rc" -eq 0 ] && ! ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
+              mkdir -p "$OSXCROSS_ROOT/SDK"
+              docker cp "${cid}:/osxsdk/." "$OSXCROSS_ROOT/SDK/" || true
+            fi
+
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+
+            [ "$rc" -eq 0 ] || return 1
+
+            # 完整性校验：SDK 与 clang wrapper 都必须真的落地，
+            # 否则视为本次尝试失败（避免把半个工具链写进 cache）。
+            ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1 || return 1
+            [ -d "$OSXCROSS_ROOT/bin" ] || return 1
+            ls "$OSXCROSS_ROOT"/bin/o64-clang >/dev/null 2>&1 \
+              || ls "$OSXCROSS_ROOT"/bin/*-apple-darwin*-clang >/dev/null 2>&1 \
+              || return 1
+
+            return 0
+          }
+          export -f fetch_once
+          export OSXCROSS_ROOT
+
+          # 尝试顺序：GHCR（无匿名限流）→ GHCR 重试 → Docker Hub 兜底
+          IMAGES=(
+            "ghcr.io/crazy-max/osxcross:${OSXCROSS_TAG}"
+            "ghcr.io/crazy-max/osxcross:${OSXCROSS_TAG}"
+            "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
+          )
+          BACKOFF=(15 30 0)
+
+          ok=0
+          for i in "${!IMAGES[@]}"; do
+            image="${IMAGES[$i]}"
+            attempt=$(( i + 1 ))
+            echo "::group::attempt ${attempt}/${#IMAGES[@]} — ${image} (hard timeout 600s)"
+
+            # 每次尝试前清空目录，避免上一次失败留下的半成品混入。
+            rm -rf "${OSXCROSS_ROOT:?}"/* "${OSXCROSS_ROOT:?}"/.[!.]* 2>/dev/null || true
+
+            # 必须显式收集退出码：`if cmd; then ... fi` 走 false 分支后
+            # $? 会被重置为 0，直接读 $? 会丢掉 timeout 的 124。
+            rc=0
+            timeout --signal=TERM --kill-after=60 600 \
+              bash -c 'fetch_once "$1"' _ "$image" || rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              echo "attempt ${attempt} succeeded"
+              ok=1
+              echo "::endgroup::"
+              break
+            fi
+
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "attempt ${attempt} TIMED OUT after 600s (registry stall / rate limit)"
+            else
+              echo "attempt ${attempt} failed with exit code ${rc}"
+            fi
+            echo "::endgroup::"
+
+            sleep "${BACKOFF[$i]}"
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::osxcross 工具链拉取失败：${#IMAGES[@]} 次尝试全部未成功（tag=${OSXCROSS_TAG}）。常见原因：Docker Hub 匿名拉取限流、GHCR 无该 tag、runner 磁盘不足。可用 workflow_dispatch 的 osxcross_tag 换一个 tag（格式 xx.x-rx-ubuntu，如 14.5-r0-ubuntu / 26.1-r0-ubuntu）后重跑。"
+            exit 1
           fi
-          docker rm -f "$CID" >/dev/null
 
+          echo "disk after: $(df -h / | tail -1)"
           echo "--- osxcross/bin (head) ---"
           ls "$OSXCROSS_ROOT/bin" | head -40
           echo "--- SDK ---"
