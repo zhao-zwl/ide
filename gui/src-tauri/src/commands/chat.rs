@@ -1,6 +1,6 @@
 //! Chat 流式交互命令（逐 token 向前端 emit `chat-token` / `chat-done` / `chat-error`）。
 
-use crate::error::GuiError;
+use crate::error::{GuiError, GuiResult};
 use crate::grpc::stream;
 use crate::ipc::{ChatSendRequest, ChatStopRequest};
 use crate::state::AppState;

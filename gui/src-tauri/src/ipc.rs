@@ -7,7 +7,12 @@
 use crate::error::GuiError;
 use ide_core::admin::ConsoleStatus as CoreConsoleStatus;
 use ide_core::collab::{Comment as CoreComment, Lock as CoreLock};
-use ide_core::quest::{PendingApproval as CorePendingApproval, QuestReport as CoreQuestReport, SubTask as CoreSubTask, SubTaskStatus};
+// `SubTaskStatus` 在本模块下方另有一个面向前端的同名 DTO 枚举（serde snake_case），
+// 因此 core 侧的同名类型必须以别名导入，否则 E0255「name defined multiple times」。
+use ide_core::quest::{
+    PendingApproval as CorePendingApproval, QuestReport as CoreQuestReport,
+    SubTask as CoreSubTask, SubTaskStatus as CoreSubTaskStatus,
+};
 use serde::{Deserialize, Serialize};
 
 // ----------------------------- 启动 / 连接 --------------------------------
@@ -186,12 +191,14 @@ impl From<CoreSubTask> for SubTaskDto {
         Self {
             id: s.id,
             description: s.description,
+            // 左侧是 core 枚举（scrutinee `s.status: CoreSubTaskStatus`），
+            // 右侧是本模块面向前端的 DTO 枚举 `SubTaskStatus`。两者不可混用。
             status: match s.status {
-                SubTaskStatus::Pending => SubTaskStatus::Pending,
-                SubTaskStatus::Running => SubTaskStatus::Running,
-                SubTaskStatus::Success => SubTaskStatus::Success,
-                SubTaskStatus::Failed => SubTaskStatus::Failed,
-                SubTaskStatus::Skipped => SubTaskStatus::Skipped,
+                CoreSubTaskStatus::Pending => SubTaskStatus::Pending,
+                CoreSubTaskStatus::Running => SubTaskStatus::Running,
+                CoreSubTaskStatus::Success => SubTaskStatus::Success,
+                CoreSubTaskStatus::Failed => SubTaskStatus::Failed,
+                CoreSubTaskStatus::Skipped => SubTaskStatus::Skipped,
             },
         }
     }

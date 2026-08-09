@@ -1,6 +1,6 @@
 //! RunAgent 流式交互命令（逐事件向前端 emit `agent-event` / `agent-done` / `agent-error`）。
 
-use crate::error::GuiError;
+use crate::error::{GuiError, GuiResult};
 use crate::grpc::stream;
 use crate::ipc::{AgentRunRequest, ChatStopRequest};
 use crate::state::AppState;

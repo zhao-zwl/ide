@@ -9,8 +9,8 @@ use ide_core::agent::build_llm;
 use ide_core::host::{CliHost, HostBridge};
 use ide_core::llm::Llm;
 use ide_core::quest::{LlmGoalDecomposer, Quest, QuestConfig};
-use ide_core::tool_executor::{BasicToolExecutor, ToolExecutor, Validator};
-use ide_core::validator::BasicValidator;
+use ide_core::tool_executor::{BasicToolExecutor, ToolExecutor};
+use ide_core::validator::{BasicValidator, Validator};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
