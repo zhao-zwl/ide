@@ -322,6 +322,89 @@ jobs:
             || { echo "::error::osxcross 未产出 Mach-O，交叉工具链不可用"; exit 1; }
 
       # -------------------------------------------------------------------
+      # 前瞻探针：逐个 framework 试链，提前暴露 "framework not found"。
+      #
+      # 为什么值得单开一步（到第 14 轮的教训）：
+      #   * `cargo check` 只做类型检查 / 名字解析（产出 .rmeta，不做 codegen），
+      #     按其能力边界**永远拦不住链接期错误**；到目前为止 `ld:` /
+      #     `framework not found` / `Undefined symbols` 一次都没命中过。
+      #   * 真正的 Tauri v2 ↔ osxcross framework 链接碰撞，只会发生在 step
+      #     "Cross-compile Rust"，而那一步在 ollama / PostgreSQL / 模型权重三个
+      #     大下载之后，单次代价 9~10 分钟。等编译错误清零后第一次撞上它，
+      #     又得白烧一整轮。
+      #   * 本探针只花 1~2 秒，且**完全不依赖 Rust 代码编译通过**，就能在流水线
+      #     最前面拿到「SDK 里哪些 framework 可链、哪些缺失」的完整清单。
+      #
+      # 设计要点：
+      #   * 逐个 framework 单独 -framework 链接一个 trivial 程序、单独汇报，
+      #     绝不一次性全传 —— 否则一个缺失就整体失败、看不出到底缺哪个。
+      #   * 这是**前瞻探测不是门禁**：单个失败只记 ::warning:: 且 `|| true`，
+      #     不阻断 job。只有当**全部**失败（说明 SDK 严重损坏 / SDKROOT 没配对）
+      #     才升级为 ::error:: 并让步骤失败。
+      #   * framework 清单覆盖 Tauri v2 GUI 运行时依赖：
+      #       - WebKit    : wry 的 WKWebView（前端渲染核心）
+      #       - AppKit    : tao 的窗口 / 菜单 / 事件循环（NSApplication）
+      #       - Security / CoreFoundation / Foundation : 基础运行时 & 钥匙串
+      #       - CoreGraphics / QuartzCore : 绘制 / 图层
+      #       - CoreServices / SystemConfiguration : 文件类型 / 网络可达性
+      #       - IOKit     : 电源 / 设备信息（tao 依赖）
+      #       - Carbon    : tao 的全局快捷键 / 旧事件 API（HIToolbox）
+      #     宁可多试几个 —— 探针便宜，信息无价。
+      # -------------------------------------------------------------------
+      - name: Probe Tauri frameworks against osxcross SDK (forward-looking, non-gating)
+        run: |
+          # 探针步骤，绝不因单个 framework 缺失而拖垮整个 job：显式关 -e。
+          set +e -o pipefail
+
+          printf 'int main(void){return 0;}\n' > /tmp/fwprobe.c
+
+          FRAMEWORKS=(
+            WebKit AppKit Security CoreFoundation Foundation
+            CoreGraphics CoreServices SystemConfiguration IOKit
+            Carbon QuartzCore
+          )
+
+          ok_list=""
+          fail_list=""
+          n_ok=0
+          n_fail=0
+
+          for fw in "${FRAMEWORKS[@]}"; do
+            out="$("$CC_x86_64_apple_darwin" /tmp/fwprobe.c -framework "$fw" \
+                    -o "/tmp/fwprobe.$fw" 2>&1)"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "  [OK]   -framework $fw"
+              ok_list="${ok_list:+$ok_list }$fw"
+              n_ok=$((n_ok + 1))
+            else
+              # 只截取最有信息量的一行（ld / clang 的 not found 提示）。
+              reason="$(printf '%s\n' "$out" \
+                        | grep -aiE 'framework not found|ld:|clang: error:' \
+                        | head -1 | tr -d '\r' | cut -c1-300)"
+              [ -n "$reason" ] || reason="rc=$rc（详见 job log）"
+              echo "  [FAIL] -framework $fw — $reason"
+              # 前瞻探测：单个失败仅 warning，不阻断。
+              echo "::warning::framework_probe FAIL -framework ${fw}: ${reason}"
+              fail_list="${fail_list:+$fail_list }$fw"
+              n_fail=$((n_fail + 1))
+            fi
+            rm -f "/tmp/fwprobe.$fw" 2>/dev/null || true
+          done
+
+          echo "framework_probe summary: ${n_ok} OK / ${n_fail} FAIL (total ${#FRAMEWORKS[@]})"
+          echo "::warning::framework_probe OK(${n_ok})=[${ok_list:-none}] FAIL(${n_fail})=[${fail_list:-none}]"
+
+          # 全部失败 ⇒ SDK / SDKROOT 有严重问题，升级为 error 并让本步骤失败，
+          # 这样能在三大下载之前就把「链接根本不可用」的信号顶到最前面。
+          if [ "$n_ok" -eq 0 ]; then
+            echo "::error::framework_probe 全部 ${#FRAMEWORKS[@]} 个 framework 链接失败 —— osxcross SDK 或 SDKROOT 配置存在严重问题（不是单个 framework 缺失）。"
+            exit 1
+          fi
+          # 部分失败不阻断：留待 Cross-compile 步骤据实际依赖判定。
+          exit 0
+
+      # -------------------------------------------------------------------
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
@@ -377,6 +460,12 @@ jobs:
       # 错误 —— 后者仍由下面的 "Cross-compile Rust" 步骤兜底。
       # -------------------------------------------------------------------
       - name: Fast frontend check (cargo check, fail early with annotations)
+        # 双保险层 1（覆盖顶层 env 的 CARGO_TERM_COLOR: always）：
+        # run #14 因全局 `always` 让 --message-format=short 的诊断行被 ANSI 色码
+        # 包住，annotate 脚本的位置正则集体失配、file:line:col 全丢。这里在 step
+        # 级强制 never，从源头产出无色诊断；annotate 脚本内部另有剥色兜底（层 2）。
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           # 与其它加固步骤一致：显式关 -e，保留 pipefail 以便取管道退出码。
           set +e -o pipefail
@@ -410,8 +499,10 @@ jobs:
           # -e 已关闭，显式以 0 结束，避免最后一条命令的退出码误判本步骤
           exit 0
 
-      - name: Upload cargo check log on failure
-        if: failure()
+      # 无论成败都上传：失败时留错误上下文；成功时的 10 条 warning 列表同样有
+      # 排查价值（谁引入了未使用 import / dead_code），而本日志才 ~5 KB，白留。
+      - name: Upload cargo check log (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cargo-check-log
@@ -585,6 +676,12 @@ jobs:
 
       # -------------------------------------------------------------------
       - name: Cross-compile Rust (aidea + aidea-gui) for x86_64-apple-darwin
+        # 双保险层 1（覆盖顶层 CARGO_TERM_COLOR: always）：同 Fast frontend check，
+        # 强制无色诊断，保证 --message-format=short 的 file:line:col 不被 ANSI 遮蔽。
+        # 链接期诊断（ld/clang）本就是纯字面量、不受色码开关影响，但类型错误的
+        # 位置信息全靠这里 + annotate 脚本的剥色兜底。
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           # GitHub 默认 bash 是 `bash -eo pipefail`，-e 始终开着。显式关掉 -e，
           # 让 cargo 失败后仍能执行下面的注解逻辑；保留 pipefail 以便取管道退出码。
