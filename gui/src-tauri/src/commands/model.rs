@@ -1,7 +1,7 @@
 //! 模型后端命令：本地模型列表 / 切换本地模型。
 
 use crate::config::save_vendor_config;
-use crate::error::{GuiError, GuiResult};
+use crate::error::GuiResult;
 use crate::grpc::client;
 use crate::ipc::VendorKind;
 use crate::state::AppState;
@@ -34,8 +34,13 @@ pub async fn model_list_local(app: AppHandle) -> GuiResult<Vec<String>> {
 /// 切换本地模型名（持久化 + 重启 serve；serve 以模型名注入 env）。
 #[tauri::command]
 pub async fn set_local_model(app: AppHandle, model: String) -> GuiResult<()> {
+    // `state` 必须先绑定为具名局部变量，否则 `State<'_, AppState>` 临时值在本条
+    // `let` 语句结束就被丢弃，而 MutexGuard 还借着它 → E0716。
+    // 块的尾表达式 `v.clone()` 经 Deref 走 `VendorConfig::clone`，传出的是 owned
+    // 数据而非借用；守卫在块结束即 drop，早于下面的 .await（MutexGuard 非 Send）。
     let config = {
-        let mut v = app.state::<AppState>().vendor.lock().unwrap();
+        let state = app.state::<AppState>();
+        let mut v = state.vendor.lock().unwrap();
         v.local_model = model.clone();
         v.clone()
     };
