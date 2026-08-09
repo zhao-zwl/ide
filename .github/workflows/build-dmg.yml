@@ -675,6 +675,33 @@ jobs:
           fi
 
       # -------------------------------------------------------------------
+      # 三大下载的**分项断言**（run #17 新增）。
+      #
+      # 为什么必须有这一步：上面三个下载步骤的所有失败路径都是
+      # `::warning::` + `exit 0` —— 下载失败时步骤照样 success。run #16 里
+      # ollama 4s / PostgreSQL 4s / 模型权重 11s 三步全绿、artifact 586.22 MiB，
+      # 但这个总量**无法归因到具体哪一项**，"三步绿" 并不证明三样东西都在包里。
+      # 本步骤把隐式 warning 变成显式断言，并把分项体积打进注解。
+      #
+      # 位置：刻意放在 "Cross-compile Rust" **之前**。缺件就立刻失败，
+      #       不必先白烧 142s 的 LTO 构建（沿用 Fast frontend check 的同款思路）。
+      #
+      # 口径：ollama / PostgreSQL 缺失 ⇒ 硬失败（后端栈必需）；
+      #       模型权重维持 best-effort，但注解里必须明确 BAKED / SKIPPED。
+      # -------------------------------------------------------------------
+      - name: Verify downloaded payload components (ollama / postgres / model)
+        run: |
+          set +e -o pipefail
+          trap 'echo "::error::PAYLOAD_VERIFY_UNCAUGHT rc=$? line=$LINENO"' ERR
+
+          rc=0
+          bash scripts/ci/verify-payload.sh \
+            .bundle \
+            "gui/src-tauri/resources/models/nes-tab/qwen2.5-0.5b.gguf" || rc=$?
+
+          exit "$rc"
+
+      # -------------------------------------------------------------------
       - name: Cross-compile Rust (aidea + aidea-gui) for x86_64-apple-darwin
         # 双保险层 1（覆盖顶层 CARGO_TERM_COLOR: always）：同 Fast frontend check，
         # 强制无色诊断，保证 --message-format=short 的 file:line:col 不被 ANSI 遮蔽。
@@ -851,6 +878,50 @@ jobs:
 
           tar -czf aidea-bundle.tar.gz -C "$STAGE" .
           ls -lh aidea-bundle.tar.gz
+
+      # -------------------------------------------------------------------
+      # 产物真实性门禁（run #17 新增）—— "编出来了" ≠ "能跑"。
+      #
+      # 586.22 MiB 只证明打包步骤跑完了，完全没有证明二进制能在真实 Intel Mac
+      # 上启动。Linux runner 无法**执行** Mach-O，但可以**静态检查**：
+      #   B1 cputype 必须 x86_64（用户机是 Intel，出 arm64 整个包作废）
+      #   B2 minos 必须 10.15 ← 最重要。链接成功 ≠ deployment target 生效；
+      #      若 ld64 把 minos 静默提到 26.1，dyld 会在用户机上直接拒绝启动，
+      #      而 CI 永远发现不了。**硬失败，绝不降级为 warning。**
+      #   B3 LC_LOAD_DYLIB 不得泄漏构建机本地路径
+      #   B4 两个二进制存在且体积超阈值
+      # 断言实现与自测见 scripts/ci/verify-macho.sh（`--self-test` 可离线跑）。
+      #
+      # 本步骤失败 ⇒ 后面的 Upload 不执行，坏包**不会**流到用户手里。
+      # -------------------------------------------------------------------
+      - name: Verify Mach-O artifacts & payload inventory (gate before upload)
+        run: |
+          set +e -o pipefail
+          trap 'echo "::error::MACHO_VERIFY_UNCAUGHT rc=$? line=$LINENO"' ERR
+
+          STAGE="dist-bundle"
+
+          # ---- C3：把 586 MiB 归因到各顶层目录，写进注解 --------------------
+          # 纯诊断，全部 `|| true`：绝不因统计失败把门禁步骤带挂。
+          echo "::group::payload inventory"
+          du -sh "$STAGE"/payload/* 2>/dev/null | sort -h || true
+          echo "--- stage total / tarball ---"
+          du -sh "$STAGE" 2>/dev/null || true
+          ls -lh aidea-bundle.tar.gz 2>/dev/null || true
+          echo "::endgroup::"
+
+          INV="$(du -sk "$STAGE"/payload/* 2>/dev/null \
+                 | awk '{ n = $2; sub(/.*\//, "", n); printf "%s=%.1fMB ", n, $1/1024 }' || true)"
+          TARB="$(wc -c < aidea-bundle.tar.gz 2>/dev/null | tr -d ' ' || true)"
+          echo "::notice::bundle_inventory ${INV}tarball=$(awk -v b="${TARB:-0}" 'BEGIN{ printf "%.1fMB", b/1048576 }')"
+
+          # ---- B1~B4：对**实际入包**的两个二进制做断言 ----------------------
+          rc=0
+          bash scripts/ci/verify-macho.sh "x86_64" "${MACOSX_DEPLOYMENT_TARGET}" \
+            "aidea-gui=${STAGE}/payload/macos/aidea-gui" \
+            "aidea=${STAGE}/payload/bin/aidea-${TARGET_TRIPLE}" || rc=$?
+
+          exit "$rc"
 
       # -------------------------------------------------------------------
       - name: Upload bundle artifact
