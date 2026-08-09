@@ -50,7 +50,7 @@
     "macOS": {
       "minimumSystemVersion": "10.15",
       "signingIdentity": null,
-      "hardening": true,
+      "hardened-runtime": false,
       "dmg": {
         "windowSize": { "width": 660, "height": 400 },
         "appPosition": { "x": 180, "y": 170 },
