@@ -152,109 +152,53 @@ jobs:
         run: |
           # 注意：这里故意不开 `-e`，重试循环需要自己判断每次尝试的退出码。
           set -uo pipefail
+          # 任何未预料到的错误都打一条 ::error::，便于无鉴权时从 annotations 定位（job 日志 403 不可匿名读）
+          trap 'echo "::error::FETCH_UNCAUGHT rc=$? line=$LINENO"' ERR
 
           echo "disk before: $(df -h / | tail -1)"
 
-          # 每次尝试的 stderr/stdout 落到这个文件，父 shell 事后取末尾几行
-          # 塞进 ::error:: —— 匿名访客在 Actions 页面就能看到失败原因。
           PULL_LOG=/tmp/osxcross-pull.log
-          export PULL_LOG
+          : > "$PULL_LOG"
 
-          # 单次尝试：pull -> create -> cp -> 校验。任何一步失败都返回非 0。
-          fetch_once() {
-            local image="$1"
-            local log="${PULL_LOG:-/tmp/osxcross-pull.log}"
-            local cid=""
-            local rc=0
-
-            # 子 shell 不继承外层的 shell 选项，pipefail 必须重新打开，
-            # 否则 `docker pull | tee` 只会返回 tee 的 0。
-            set -o pipefail
-
-            echo "--- docker pull ${image} ---"
-            if ! docker pull --platform linux/amd64 "$image" 2>&1 | tee -a "$log"; then
-              echo "docker pull failed: ${image}" >> "$log"
-              return 1
-            fi
-
-            # 该镜像没有默认 CMD/ENTRYPOINT，`docker create` 不传命令会报
-            # 「no command specified」而失败（run #6 attempt 1/3 触发）。
-            # 容器只用于 `docker cp` 取文件、不会真正启动，这里显式给一个
-            # 必然存在的命令（镜像基于 ubuntu，`/bin/sh` 一定存在）即可绕过。
-            cid="$(docker create --platform linux/amd64 "$image" /bin/sh 2>>"$log")" || {
-              echo "docker create failed: ${image}" >> "$log"
-              return 1
-            }
-
-            mkdir -p "$OSXCROSS_ROOT"
-            echo "--- docker cp ${cid}:/osxcross/. -> ${OSXCROSS_ROOT}/ ---"
-            docker cp "${cid}:/osxcross/." "$OSXCROSS_ROOT/" 2>>"$log" || {
-              echo "docker cp /osxcross failed: ${image}" >> "$log"
-              rc=1
-            }
-
-            # SDK 可能不在 /osxcross/SDK 而在 /osxsdk
-            if [ "$rc" -eq 0 ] && ! ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
-              mkdir -p "$OSXCROSS_ROOT/SDK"
-              docker cp "${cid}:/osxsdk/." "$OSXCROSS_ROOT/SDK/" 2>>"$log" || true
-            fi
-
-            docker rm -f "$cid" >/dev/null 2>&1 || true
-
-            [ "$rc" -eq 0 ] || return 1
-
-            # 完整性校验：SDK 与 clang wrapper 都必须真的落地，
-            # 否则视为本次尝试失败（避免把半个工具链写进 cache）。
-            ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1 || {
-              echo "verify failed: no MacOSX*.sdk under ${OSXCROSS_ROOT}/SDK" >> "$log"
-              return 1
-            }
-            [ -d "$OSXCROSS_ROOT/bin" ] || {
-              echo "verify failed: missing ${OSXCROSS_ROOT}/bin" >> "$log"
-              return 1
-            }
-            ls "$OSXCROSS_ROOT"/bin/o64-clang >/dev/null 2>&1 \
-              || ls "$OSXCROSS_ROOT"/bin/*-apple-darwin*-clang >/dev/null 2>&1 \
-              || {
-                   echo "verify failed: no clang wrapper in ${OSXCROSS_ROOT}/bin" >> "$log"
-                   return 1
-                 }
-
-            return 0
-          }
-          export -f fetch_once
-          export OSXCROSS_ROOT
-
-          # 镜像源：只用 Docker Hub（26.1-r0-ubuntu 已确认存在且可匿名拉取）。
-          # GHCR 已被排除 —— 匿名拉取返回 403 denied（run #6 attempt 2 验证），
-          # 不可用。为满足「最多 3 次重试」，把同一 docker.io 项列 3 次，
-          # 这样每次尝试都从已验证可用的源重试，不浪费在必然失败的 GHCR 上。
+          # 镜像源：仅 Docker Hub（26.1-r0-ubuntu 已确认存在且可匿名拉取）。
+          # GHCR 匿名 denied，已排除。列 3 次满足「最多 3 次重试」。
           IMAGES=(
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
           )
-          # 最多 3 次尝试，按上面的顺序循环取源（三次都是 docker.io）
           MAX_ATTEMPTS=3
           BACKOFF=(15 30 0)
 
+          mkdir -p "$OSXCROSS_ROOT"
+
           ok=0
           for (( attempt = 1; attempt <= MAX_ATTEMPTS; attempt++ )); do
-            image="${IMAGES[$(( (attempt - 1) % ${#IMAGES[@]} ))]}"
+            image="${IMAGES[$(( attempt - 1 ))]}"
             echo "::group::attempt ${attempt}/${MAX_ATTEMPTS} — ${image} (hard timeout 600s)"
-
-            # 每次尝试前清空目录，避免上一次失败留下的半成品混入。
             rm -rf "${OSXCROSS_ROOT:?}"/* "${OSXCROSS_ROOT:?}"/.[!.]* 2>/dev/null || true
-            # 清空日志，保证 last_error 只反映本次尝试
             : > "$PULL_LOG"
 
-            # 必须显式收集退出码：`if cmd; then ... fi` 走 false 分支后
-            # $? 会被重置为 0，直接读 $? 会丢掉 timeout 的 124。
-            rc=0
+            # 用 docker run（自带命令）代替 docker create + cp + rm 三段式：
+            # 该镜像没有默认 CMD，docker create 不传命令会报 no command specified（run #6 已踩）；
+            # 直接 docker run 并显式给 /bin/sh -c，把 /osxcross 拷进挂载目录 /out 即可。
             timeout --signal=TERM --kill-after=60 600 \
-              bash -c 'fetch_once "$1"' _ "$image" || rc=$?
+              docker run --rm --platform linux/amd64 \
+                -v "${OSXCROSS_ROOT}:/out" \
+                "$image" /bin/sh -c 'set -e; cp -a /osxcross/. /out/; mkdir -p /out/SDK; if ls /osxsdk >/dev/null 2>&1; then cp -a /osxsdk/. /out/SDK/; fi' \
+              2>&1 | tee -a "$PULL_LOG"
+            rc=${PIPESTATUS[0]}
 
-            if [ "$rc" -eq 0 ]; then
+            sdk_ok=0
+            if [ -d "$OSXCROSS_ROOT/SDK" ] && ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
+              if [ -d "$OSXCROSS_ROOT/bin" ] \
+                 && { ls "$OSXCROSS_ROOT"/bin/o64-clang >/dev/null 2>&1 \
+                      || ls "$OSXCROSS_ROOT"/bin/*-apple-darwin*-clang >/dev/null 2>&1; }; then
+                sdk_ok=1
+              fi
+            fi
+
+            if [ "$rc" -eq 0 ] && [ "$sdk_ok" -eq 1 ]; then
               echo "attempt ${attempt} succeeded"
               ok=1
               echo "::endgroup::"
@@ -268,9 +212,7 @@ jobs:
             fi
             echo "::endgroup::"
 
-            # ::error:: 必须是单行：把日志末尾几行压成一行并截断。
-            last_error="$(tail -n 5 "$PULL_LOG" 2>/dev/null \
-              | tr -d '\r' | tr '\n' ' ' | tr -s ' ' | cut -c1-800)"
+            last_error="$(tail -n 8 "$PULL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | tr -s ' ' | cut -c1-900)"
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               last_error="timed out after 600s; ${last_error}"
             fi
@@ -280,7 +222,7 @@ jobs:
           done
 
           if [ "$ok" -ne 1 ]; then
-            echo "::error::osxcross 工具链拉取失败：${MAX_ATTEMPTS} 次尝试全部未成功（tag=${OSXCROSS_TAG}）。常见原因：该 tag 已被上游下架、Docker Hub 匿名拉取限流、runner 磁盘不足。逐次失败原因见上面每条 attempt 的 ::error::。可用 workflow_dispatch 的 osxcross_tag 换一个仍在架的 tag（如 26.1-r0-ubuntu / edge / latest）后重跑。"
+            echo "::error::osxcross 工具链拉取失败：${MAX_ATTEMPTS} 次尝试全部未成功（tag=${OSXCROSS_TAG}）。逐次失败原因见上面每条 attempt 的 ::error::。"
             exit 1
           fi
 
