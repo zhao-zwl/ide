@@ -517,23 +517,51 @@ jobs:
       # -------------------------------------------------------------------
       - name: Cross-compile Rust (aidea + aidea-gui) for x86_64-apple-darwin
         run: |
-          set -euo pipefail
+          # GitHub 默认 bash 是 `bash -eo pipefail`，-e 始终开着。显式关掉 -e，
+          # 让 cargo 失败后仍能执行下面的注解逻辑；保留 pipefail 以便取管道退出码。
+          set +e -o pipefail
+          trap 'echo "::error::CARGO_UNCAUGHT rc=$? line=$LINENO"' ERR
+
+          CARGO_LOG=/tmp/cargo-cross.log
+          : > "$CARGO_LOG"
+
           build() {
             cargo build --release --target "$TARGET_TRIPLE" -p aidea -p aidea-gui
           }
+
+          # job 日志与 artifact 都需要鉴权才能读，annotations 则是公开可读的。
+          # 因此把 CARGO_LOG 里的关键错误行压成单行，用 ::error:: 注解暴露出来。
+          emit_cargo_error() {
+            excerpt="$(grep -aE 'error\[|error:|panic|cannot find|undefined symbol|framework not found|ld:|linker' "$CARGO_LOG" | tail -n 60)"
+            if [ -z "$excerpt" ]; then
+              excerpt="$(tail -n 60 "$CARGO_LOG")"
+            fi
+            excerpt="$(printf '%s' "$excerpt" | tr '\r\n\t' '   ' | tr -s ' ' | cut -c1-4000)"
+            echo "::error::cargo_build ${excerpt}"
+          }
+
           echo "::group::attempt 1 (repo release profile: lto=true, codegen-units=1)"
-          if build 2>&1 | tee /tmp/cargo1.log; then
+          build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo1.log
+          rc=${PIPESTATUS[0]}
+          echo "::endgroup::"
+          if [ "$rc" -eq 0 ]; then
             echo "ok"
           else
-            echo "::endgroup::"
             echo "::warning::带 LTO 的构建失败（runner 常见 OOM），关闭 LTO 重试"
             echo "::group::attempt 2 (lto=off, codegen-units=256)"
             CARGO_PROFILE_RELEASE_LTO=false \
             CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
             CARGO_PROFILE_RELEASE_INCREMENTAL=false \
-              build 2>&1 | tee /tmp/cargo2.log
+              build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo2.log
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
           fi
-          echo "::endgroup::"
+
+          if [ "$rc" -ne 0 ]; then
+            emit_cargo_error
+            echo "::error::cargo_build_failed rc=$rc (both attempts, lto on + lto off)"
+            exit "$rc"
+          fi
 
           # workspace 统一输出到仓库根 target/；兼容 gui/src-tauri/target/ 布局
           OUT=""
@@ -546,6 +574,9 @@ jobs:
           file "$OUT/aidea-gui" "$OUT/aidea"
           file "$OUT/aidea-gui" | grep -qi "Mach-O 64-bit x86_64" \
             || echo "::warning::aidea-gui 不是预期的 Mach-O x86_64（请核对 file 输出）"
+
+          # -e 已关闭，显式以 0 结束，避免最后一条命令的退出码误判本步骤
+          exit 0
 
       - name: Upload cargo logs on failure
         if: failure()
