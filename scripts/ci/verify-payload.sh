@@ -26,8 +26,12 @@
 #     qwen2.5-0.5b q4_k_m   约 400 MiB
 #
 # 用法:
-#   verify-payload.sh <bundle_dir> <model_gguf_path>
+#   verify-payload.sh <bundle_dir> <model_gguf_path> [facts_dir]
 #   verify-payload.sh --self-test
+#
+#   facts_dir（默认 .ci-facts）：下载步骤落盘的事实文件目录，目前含
+#     ollama-tgz.txt      —— ollama-darwin.tgz 的完整条目清单
+#     ollama-runners.txt  —— "<BUNDLED|ABSENT|EMBEDDED> <hits>"
 # =============================================================================
 
 set -uo pipefail   # 不开 -e：由脚本自己收敛退出码
@@ -52,6 +56,7 @@ human()     { awk -v b="${1:-0}" 'BEGIN{ if (b >= 1048576) printf "%.1fMB", b/10
 main() {
   local BUNDLE="${1:-.bundle}"
   local MODEL="${2:-}"
+  local FACTS="${3:-.ci-facts}"
   local n_fail=0
 
   echo "::group::payload inventory (${BUNDLE})"
@@ -79,8 +84,38 @@ main() {
     ollama_rep="CORRUPT($(human "$ollama_sz"))"
   else
     ollama_rep="$(human "$ollama_sz")"
-    [ "$ollama_runner_sz" -gt 0 ] && ollama_rep="${ollama_rep}+runners$(human "$ollama_runner_sz")"
   fi
+
+  # ---- runner 三态（run #18 新增）-----------------------------------------
+  # run #17 的注解只是「有 runner 就加个 +runnersXX 后缀」，没有就什么都不打
+  #  —— 于是「runner 不存在」和「runner 存在但没拷进来」这两种**后果天差地别**
+  # 的情况长得一模一样。这里升级成显式三态，让下一轮不必靠猜：
+  #   BUNDLED(xxMB)  : runner 已入包
+  #   ABSENT         : 上游 tgz 里**确实带**外置 runner，但没进包
+  #                    ⇒ 用户机大概率 "no compatible runner found"，
+  #                      模型对话不可用，会抵消 model_weights=BAKED 的全部价值
+  #   N/A(embedded)  : 上游 tgz 里只有 ollama 本体，runner 内嵌 ⇒ 无害
+  #   UNKNOWN        : 没拿到 tgz 清单（走了单文件分支 / 下载失败）
+  # 判定依据由下载步骤写在 ${FACTS}/ollama-runners.txt（"<STATE> <hits>"）。
+  # **本轮只观测不 gate**：是否该 gate 取决于 ollama darwin 的真实行为，
+  # 先拿一轮事实再定。
+  local runner_state runner_hits runner_rep
+  runner_state="$(awk 'NR==1{print $1}' "${FACTS}/ollama-runners.txt" 2>/dev/null || true)"
+  runner_hits="$( awk 'NR==1{print $2+0}' "${FACTS}/ollama-runners.txt" 2>/dev/null || true)"
+  runner_hits="${runner_hits:-0}"
+  case "${runner_state:-}" in
+    BUNDLED)  runner_rep="BUNDLED($(human "$ollama_runner_sz"))" ;;
+    ABSENT)   runner_rep="ABSENT(${runner_hits}-in-tgz)"
+              echo "::warning::payload_check ollama runners=ABSENT — 上游 ollama-darwin.tgz 里有 ${runner_hits} 个外置 runner 类条目（llama-server / *.dylib / mlx_*），但一个都没进包：打包逻辑只按 <exe>/../lib/ollama 这一种布局找 runner，而该 tgz 是**全平铺**布局（所有文件都在归档根目录），因此没命中。若 ollama 在用户机上找不到 runner，会报 'no compatible runner found'，端模型对话直接不可用 —— 那会抵消 model_weights=BAKED 的全部价值。**本轮仅观测不阻断**，请据此注解决定下一轮是否补拷。" ;;
+    EMBEDDED) runner_rep="N/A(embedded)" ;;
+    *)        runner_rep="UNKNOWN" ;;
+  esac
+  # runner 状态只在 ollama 本体存在时才有意义
+  case "$ollama_rep" in
+    MISSING|CORRUPT*) : ;;
+    *) ollama_rep="${ollama_rep}+runners=${runner_rep}" ;;
+  esac
+  echo "  runners: state=${runner_state:-UNKNOWN} hits=${runner_hits} bundled_size=$(human "$ollama_runner_sz")"
 
   # =========================================================================
   # C2-b  PostgreSQL —— 四个 sidecar + lib + share，缺失硬失败
@@ -228,6 +263,44 @@ self_test() {
   # --- 形态 8：BAKED 注解正确 ---
   out="$(main "$B" "$M" 2>&1 | grep -c '^::notice::payload_check .*model_weights=BAKED')"
   _expect "汇总注解含 model_weights=BAKED" 1 "$out"
+
+  # =========================================================================
+  # 形态 9~13：runner 三态注解（run #18 新增）
+  # 这四种状态对用户的后果完全不同，注解必须能一眼区分，不能再靠"有没有后缀"猜。
+  # =========================================================================
+  local F="$tmp/facts"; mkdir -p "$F"
+
+  # 9) EMBEDDED —— tgz 里只有 ollama 本体，runner 内嵌 ⇒ 无害
+  printf 'EMBEDDED 0\n' > "$F/ollama-runners.txt"
+  out="$(main "$B" "$M" "$F" 2>&1 | grep -c '^::notice::payload_check .*runners=N/A(embedded)')"
+  _expect "runners=N/A(embedded)" 1 "$out"
+
+  # 10) ABSENT —— tgz 带外置 runner 却没进包 ⇒ 注解 + 解释性 warning，但不阻断
+  printf 'ABSENT 7\n' > "$F/ollama-runners.txt"
+  out="$(main "$B" "$M" "$F" 2>&1 | grep -c '^::notice::payload_check .*runners=ABSENT(7-in-tgz)')"
+  _expect "runners=ABSENT(7-in-tgz)" 1 "$out"
+  out="$(main "$B" "$M" "$F" 2>&1 | grep -c '^::warning::payload_check ollama runners=ABSENT')"
+  _expect "ABSENT 另有 warning 解释后果" 1 "$out"
+  main "$B" "$M" "$F" >/dev/null 2>&1; _expect "★ABSENT 只观测不 gate（rc=0）" 0 "$?"
+
+  # 11) BUNDLED —— lib/ollama 有内容，报体积
+  local B9="$tmp/withrunners"; cp -a "$B" "$B9"
+  _mk "$B9/lib/ollama/libggml-base.dylib" 3072
+  printf 'BUNDLED 7\n' > "$F/ollama-runners.txt"
+  out="$(main "$B9" "$M" "$F" 2>&1 | grep -c '^::notice::payload_check .*runners=BUNDLED(')"
+  _expect "runners=BUNDLED(xxMB)" 1 "$out"
+  # BUNDLED 时 lib/ollama 必须从 postgres 的 lib 统计里扣掉，否则 pg_lib 会虚高
+  out="$(main "$B9" "$M" "$F" 2>&1 | grep -c 'postgres=bin.*lib2\.0MB')"
+  _expect "pg lib 已扣除 ollama runner 体积" 1 "$out"
+
+  # 12) 事实文件缺失（走了单文件分支 / 下载失败）⇒ UNKNOWN，不得谎报 embedded
+  out="$(main "$B" "$M" "$tmp/nonexistent-facts" 2>&1 | grep -c '^::notice::payload_check .*runners=UNKNOWN')"
+  _expect "事实文件缺失 ⇒ runners=UNKNOWN" 1 "$out"
+
+  # 13) ollama 本体缺失时不追加 runner 后缀（MISSING 要保持醒目）
+  printf 'ABSENT 7\n' > "$F/ollama-runners.txt"
+  out="$(main "$B2" "$M" "$F" 2>&1 | grep -c '^::notice::payload_check ollama=MISSING ')"
+  _expect "ollama=MISSING 时不追加 runner 后缀" 1 "$out"
 
   echo
   echo "self-test: ${pass} passed, ${fail} failed"

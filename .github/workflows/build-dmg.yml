@@ -535,6 +535,26 @@ jobs:
             echo "downloading tarball: $TGZ"
             if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama.tgz" "$TGZ"; then
               mkdir -p "$WORK/x" && tar -xzf "$WORK/ollama.tgz" -C "$WORK/x"
+
+              # ---- run #18 调查：把 tgz 的**真实目录结构**落盘 ---------------
+              # 背景：run #17 的 payload_check 报 `ollama=63.4MB`，没有
+              # `+runnersXX` 后缀 ⇒ 下面那句 `find -type d -name ollama
+              # -path '*/lib/*'` 没命中 ⇒ .bundle/lib/ollama 是空的。到底是
+              # 「ollama darwin 把 runner 内嵌进单二进制了（无害）」还是
+              # 「runner 是外置的、被我们漏拷了（模型对话直接不可用）」，
+              # 光看体积区分不了，必须把布局本身记下来。
+              #
+              # ⚠️ 注意不要写成 `tar -tzf ... | head -40`：本步骤是
+              #    `set -euo pipefail`，head 提前退出会让 tar 吃 SIGPIPE，
+              #    pipefail 把整条流水线判失败 —— 这正是 b28061c 修过的
+              #    EPIPE 假失败。所以先落盘再 head，全程不跨管道。
+              mkdir -p .ci-facts
+              tar -tzf "$WORK/ollama.tgz" > .ci-facts/ollama-tgz.txt 2>/dev/null || true
+              echo "--- ollama-darwin.tgz 内部布局（共 $(wc -l < .ci-facts/ollama-tgz.txt || echo 0) 条，取前 40）---"
+              head -40 .ci-facts/ollama-tgz.txt || true
+              echo "--- 解包后实际树（depth 2）---"
+              find "$WORK/x" -maxdepth 2 -printf '%y %10s %P\n' 2>/dev/null | sort -k3 | head -40 || true
+
               BIN="$(find "$WORK/x" -type f -name ollama | head -1 || true)"
               if [ -n "$BIN" ]; then
                 cp "$BIN" ".bundle/bin/ollama-${TARGET_TRIPLE}"
@@ -547,6 +567,24 @@ jobs:
                   echo "bundled ollama runners: $(du -sh .bundle/lib/ollama | cut -f1)"
                 fi
               fi
+
+              # ---- runner 三态判定（只观测、不改打包行为）------------------
+              # BUNDLED  : lib/ollama 拷进来了
+              # ABSENT   : tgz 里**确实带**外置 runner（llama-server / *.dylib /
+              #            mlx_*），但没进包 ⇒ 用户机大概率 "no compatible
+              #            runner found"，模型对话不可用
+              # EMBEDDED : tgz 里只有 ollama 本体 ⇒ runner 内嵌，无害
+              RUNNER_STATE="UNKNOWN"; RUNNER_HITS=0
+              if [ -d .bundle/lib/ollama ] && [ -n "$(ls -A .bundle/lib/ollama 2>/dev/null || true)" ]; then
+                RUNNER_STATE="BUNDLED"
+              else
+                RUNNER_HITS="$(grep -cE '(^|/)(llama-server|llama-quantize|ollama_llama_server)$|\.dylib$|(^|/)lib/ollama/|(^|/)mlx' \
+                                 .ci-facts/ollama-tgz.txt 2>/dev/null || true)"
+                RUNNER_HITS="${RUNNER_HITS:-0}"
+                if [ "$RUNNER_HITS" -gt 0 ]; then RUNNER_STATE="ABSENT"; else RUNNER_STATE="EMBEDDED"; fi
+              fi
+              printf '%s %s\n' "$RUNNER_STATE" "$RUNNER_HITS" > .ci-facts/ollama-runners.txt
+              echo "ollama runner state = ${RUNNER_STATE} (tgz 内 runner 类条目 ${RUNNER_HITS} 个)"
             fi
           fi
 
@@ -697,7 +735,8 @@ jobs:
           rc=0
           bash scripts/ci/verify-payload.sh \
             .bundle \
-            "gui/src-tauri/resources/models/nes-tab/qwen2.5-0.5b.gguf" || rc=$?
+            "gui/src-tauri/resources/models/nes-tab/qwen2.5-0.5b.gguf" \
+            .ci-facts || rc=$?
 
           exit "$rc"
 
@@ -915,11 +954,52 @@ jobs:
           TARB="$(wc -c < aidea-bundle.tar.gz 2>/dev/null | tr -d ' ' || true)"
           echo "::notice::bundle_inventory ${INV}tarball=$(awk -v b="${TARB:-0}" 'BEGIN{ printf "%.1fMB", b/1048576 }')"
 
-          # ---- B1~B4：对**实际入包**的两个二进制做断言 ----------------------
+          # ---- parser 自测（非阻断）-----------------------------------------
+          # 本地是 macOS 的 BSD awk，runner 上是 mawk。fat header 解析、
+          # (architecture X): 切段、版本号数值比较这几处都吃 awk 方言，
+          # 在真正下断言之前先用模拟数据在**runner 自己的 awk** 上对一遍答案。
+          #
+          # 刻意**不 gate**：本轮的首要目的是拿到 5 个 sidecar 的架构事实，
+          # 若自测因方言问题翻红，反而拿不到那批事实。失败只出 warning，
+          # 由我在汇报里跟进。真正的门禁仍是下面的 B1~B4。
+          echo "::group::verify-macho parser self-test (mawk)"
+          if bash scripts/ci/verify-macho.sh --self-test; then
+            echo "self-test OK on $(awk --version 2>/dev/null | head -1 || echo 'mawk/unknown')"
+          else
+            echo "::warning::macho_check: parser 自测在 runner 的 awk 上未全绿 —— 下面的 cputype/minos 判定可能不可信，请以本组日志为准复核（本步骤不因此阻断）。"
+          fi
+          echo "::endgroup::"
+
+          # ---- B1~B4：对**实际入包**的两个二进制做断言（strict 模式）--------
           rc=0
           bash scripts/ci/verify-macho.sh "x86_64" "${MACOSX_DEPLOYMENT_TARGET}" \
             "aidea-gui=${STAGE}/payload/macos/aidea-gui" \
             "aidea=${STAGE}/payload/bin/aidea-${TARGET_TRIPLE}" || rc=$?
+
+          # ---- run #18 新增：5 个上游 sidecar 的架构断言（sidecar 模式）-----
+          #
+          # 为什么必须加：上面两个二进制合计 17.4MB，占包体不到 3%。包里另外
+          # 5 个同样要在用户 Intel Mac 上执行的 Mach-O 全部来自上游下载
+          # （ollama 的 tgz、Postgres.app 的 dmg），架构从未检查过。
+          # Postgres.app / ollama 近年版本完全可能是 arm64-only 或 universal —— 
+          # 若是 arm64-only，用户 Intel 机上数据库或推理**启动即失败**，
+          # 而此前所有断言照样全绿。占包体 95% 以上的部分等于零监控。
+          #
+          # 口径（与主二进制刻意不同，见 verify-macho.sh 头部注释）：
+          #   B1 架构 : 必须含 x86_64 slice（thin x86_64 或 universal）⇒ 硬失败
+          #   B2 minos: **只打印不 gate**。上游 deployment target 非我方可控，
+          #             拿 10.15 硬 gate 会误杀；高于目标时只补一条 warning。
+          #   B3 泄漏 : 只记录不 gate（上游 install name 非我方可控）
+          #   B4 体积 : 下限降到 16 KiB（pg 工具本就小，2 MiB 会误杀）
+          #
+          # ⚠️ 若某个 sidecar 是 arm64-only：这里会**硬失败**并把事实打进注解。
+          #    这是刻意的 —— 不自动改下载源，先拿到事实再决定对策。
+          bash scripts/ci/verify-macho.sh --sidecar "x86_64" "${MACOSX_DEPLOYMENT_TARGET}" \
+            "ollama=${STAGE}/payload/bin/ollama-${TARGET_TRIPLE}" \
+            "postgres=${STAGE}/payload/bin/postgres-${TARGET_TRIPLE}" \
+            "initdb=${STAGE}/payload/bin/initdb-${TARGET_TRIPLE}" \
+            "pg_ctl=${STAGE}/payload/bin/pg_ctl-${TARGET_TRIPLE}" \
+            "psql=${STAGE}/payload/bin/psql-${TARGET_TRIPLE}" || rc=$?
 
           exit "$rc"
 
