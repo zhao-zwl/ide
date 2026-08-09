@@ -512,26 +512,24 @@ jobs:
 
       # -------------------------------------------------------------------
       - name: Download ollama macOS binary
+        env:
+          OLLAMA_VERSION: v0.32.6
         run: |
           set -euo pipefail
           mkdir -p .bundle/bin .bundle/lib
           WORK="$(mktemp -d)"
 
-          API="https://api.github.com/repos/ollama/ollama/releases/latest"
-          ASSETS="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" || echo '{}')"
-          # 优先单文件 ollama-darwin，其次 ollama-darwin.tgz（内含 bin/ollama + lib/ollama runner）
-          URL="$(echo "$ASSETS" | jq -r '[.assets[]?|select(.name=="ollama-darwin")|.browser_download_url][0] // empty')"
-          TGZ="$(echo "$ASSETS" | jq -r '[.assets[]?|select(.name=="ollama-darwin.tgz")|.browser_download_url][0] // empty')"
+          # 固定 ollama 版本，直接走 public release CDN 下载 tarball。
+          # 原实现依赖未认证的 api.github.com 发现资产 URL：未认证上限
+          # 60 req/h/IP，CI runner 共享 IP 极易触发 403 → ASSETS='{}' →
+          # TGZ 为空 → 二进制从不拷贝 → 被 payload 门禁判 MISSING（run #18）。
+          # 改用 releases/download/<tag>/<asset> 直链：匿名可下、无速率限制。
+          # v0.32.6 仅有 ollama-darwin.tgz（单文件 ollama-darwin 已 404），
+          # 故只保留 tarball 路径；如需换版本改上方 OLLAMA_VERSION 即可。
+          TGZ="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-darwin.tgz"
 
           got=0
-          if [ -n "$URL" ]; then
-            echo "downloading single-file: $URL"
-            if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama" "$URL"; then
-              cp "$WORK/ollama" ".bundle/bin/ollama-${TARGET_TRIPLE}"
-              got=1
-            fi
-          fi
-          if [ "$got" != 1 ] && [ -n "$TGZ" ]; then
+          if [ -n "$TGZ" ]; then
             echo "downloading tarball: $TGZ"
             if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama.tgz" "$TGZ"; then
               mkdir -p "$WORK/x" && tar -xzf "$WORK/ollama.tgz" -C "$WORK/x"
