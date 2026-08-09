@@ -150,18 +150,25 @@ jobs:
         env:
           OSXCROSS_TAG: ${{ steps.osxcross.outputs.tag }}
         run: |
-          # 注意：这里故意不开 `-e`，重试循环需要自己判断每次尝试的退出码。
-          set -uo pipefail
-          # 任何未预料到的错误都打一条 ::error::，便于无鉴权时从 annotations 定位（job 日志 403 不可匿名读）
+          # 关键修正：GitHub 默认 bash 是 `bash -eo pipefail`，-e 始终开着，
+          # 会导致第一次 docker 失败就整脚本退出、重试与 ::error:: 注解永远不执行。
+          # 显式关掉 -e（保留 pipefail 以便正确取管道退出码），重试逻辑自行判断 rc。
+          set +e -o pipefail
           trap 'echo "::error::FETCH_UNCAUGHT rc=$? line=$LINENO"' ERR
 
           echo "disk before: $(df -h / | tail -1)"
 
+          # 预检：docker / timeout 是否存在，缺失则打出清晰注解（而非 cryptic 127）
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker binary NOT FOUND on runner (this is why prior run got rc=127)"
+            exit 1
+          fi
+          HAVE_TIMEOUT=1
+          command -v timeout >/dev/null 2>&1 || HAVE_TIMEOUT=0
+
           PULL_LOG=/tmp/osxcross-pull.log
           : > "$PULL_LOG"
 
-          # 镜像源：仅 Docker Hub（26.1-r0-ubuntu 已确认存在且可匿名拉取）。
-          # GHCR 匿名 denied，已排除。列 3 次满足「最多 3 次重试」。
           IMAGES=(
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
@@ -179,15 +186,20 @@ jobs:
             rm -rf "${OSXCROSS_ROOT:?}"/* "${OSXCROSS_ROOT:?}"/.[!.]* 2>/dev/null || true
             : > "$PULL_LOG"
 
-            # 用 docker run（自带命令）代替 docker create + cp + rm 三段式：
-            # 该镜像没有默认 CMD，docker create 不传命令会报 no command specified（run #6 已踩）；
-            # 直接 docker run 并显式给 /bin/sh -c，把 /osxcross 拷进挂载目录 /out 即可。
-            timeout --signal=TERM --kill-after=60 600 \
+            if [ "$HAVE_TIMEOUT" -eq 1 ]; then
+              timeout --signal=TERM --kill-after=60 600 \
+                docker run --rm --platform linux/amd64 \
+                  -v "${OSXCROSS_ROOT}:/out" \
+                  "$image" /bin/sh -c 'set -e; cp -a /osxcross/. /out/; mkdir -p /out/SDK; if ls /osxsdk >/dev/null 2>&1; then cp -a /osxsdk/. /out/SDK/; fi' \
+                2>&1 | tee -a "$PULL_LOG"
+              rc=${PIPESTATUS[0]}
+            else
               docker run --rm --platform linux/amd64 \
-                -v "${OSXCROSS_ROOT}:/out" \
-                "$image" /bin/sh -c 'set -e; cp -a /osxcross/. /out/; mkdir -p /out/SDK; if ls /osxsdk >/dev/null 2>&1; then cp -a /osxsdk/. /out/SDK/; fi' \
-              2>&1 | tee -a "$PULL_LOG"
-            rc=${PIPESTATUS[0]}
+                  -v "${OSXCROSS_ROOT}:/out" \
+                  "$image" /bin/sh -c 'set -e; cp -a /osxcross/. /out/; mkdir -p /out/SDK; if ls /osxsdk >/dev/null 2>&1; then cp -a /osxsdk/. /out/SDK/; fi' \
+                2>&1 | tee -a "$PULL_LOG"
+              rc=${PIPESTATUS[0]}
+            fi
 
             sdk_ok=0
             if [ -d "$OSXCROSS_ROOT/SDK" ] && ls -d "$OSXCROSS_ROOT"/SDK/MacOSX*.sdk >/dev/null 2>&1; then
