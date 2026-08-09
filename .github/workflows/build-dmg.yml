@@ -177,7 +177,11 @@ jobs:
               return 1
             fi
 
-            cid="$(docker create --platform linux/amd64 "$image" 2>>"$log")" || {
+            # 该镜像没有默认 CMD/ENTRYPOINT，`docker create` 不传命令会报
+            # 「no command specified」而失败（run #6 attempt 1/3 触发）。
+            # 容器只用于 `docker cp` 取文件、不会真正启动，这里显式给一个
+            # 必然存在的命令（镜像基于 ubuntu，`/bin/sh` 一定存在）即可绕过。
+            cid="$(docker create --platform linux/amd64 "$image" /bin/sh 2>>"$log")" || {
               echo "docker create failed: ${image}" >> "$log"
               return 1
             }
@@ -221,14 +225,16 @@ jobs:
           export -f fetch_once
           export OSXCROSS_ROOT
 
-          # 镜像源：Docker Hub 优先（26.1-r0-ubuntu 已确认存在），
-          # GHCR 作兜底 —— 命名空间是 crazymax（无连字符），
-          # 之前写成 crazy-max 导致必然 404。
+          # 镜像源：只用 Docker Hub（26.1-r0-ubuntu 已确认存在且可匿名拉取）。
+          # GHCR 已被排除 —— 匿名拉取返回 403 denied（run #6 attempt 2 验证），
+          # 不可用。为满足「最多 3 次重试」，把同一 docker.io 项列 3 次，
+          # 这样每次尝试都从已验证可用的源重试，不浪费在必然失败的 GHCR 上。
           IMAGES=(
             "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
-            "ghcr.io/crazymax/osxcross:${OSXCROSS_TAG}"
+            "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
+            "docker.io/crazymax/osxcross:${OSXCROSS_TAG}"
           )
-          # 最多 3 次尝试，按上面的顺序循环取源：hub -> ghcr -> hub
+          # 最多 3 次尝试，按上面的顺序循环取源（三次都是 docker.io）
           MAX_ATTEMPTS=3
           BACKOFF=(15 30 0)
 
