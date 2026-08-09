@@ -94,6 +94,11 @@ impl AppState {
     }
 
     /// 取出某 session 的令牌（不移除），用于流式循环检测。
+    ///
+    /// 目前尚无调用方（chat/agent 流式循环的取消检测将在后续接入），暂以
+    /// `#[allow(dead_code)]` 抑制 dead_code 警告，保留这套 register/cancel/
+    /// abort_for 令牌 API 的完整性——纯抑制不改行为，零风险。
+    #[allow(dead_code)]
     pub fn abort_for(&self, session_id: &str) -> Option<CancellationToken> {
         self.aborts
             .lock()

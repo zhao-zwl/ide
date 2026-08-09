@@ -7,7 +7,9 @@ use ide_core::craft::{CraftEngine, CraftProposal, CraftState, EditKind};
 use ide_core::host::HostBridge;
 use ide_core::permissions::PermissionSet;
 use std::sync::Arc;
-use tauri::Manager;
+// 注：本模块命令均以 `_app: &tauri::AppHandle`（未使用）为签名，不调用任何
+// `Manager` trait 方法（.state()/.path() 等），故不 `use tauri::Manager`
+// —— 之前的多余 import 会触发 unused_imports 警告。
 
 /// 把前端 kind 字符串映射到 ide_core 的 [`EditKind`]。
 fn map_kind(kind: &str) -> EditKind {

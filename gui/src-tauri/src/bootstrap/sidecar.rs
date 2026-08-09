@@ -62,6 +62,11 @@ pub fn spawn_binary(
 }
 
 /// 终止一个子进程（best-effort）。
+///
+/// 目前尚无调用方（sidecar 停止路径后续接入），暂以 `#[allow(dead_code)]`
+/// 抑制 dead_code 警告，与 `spawn_binary` 配对保留完整生命周期 API——
+/// 纯抑制不改行为，零风险。
+#[allow(dead_code)]
 pub fn kill_child(mut child: Child) {
     let _ = child.kill();
     let _ = child.wait();

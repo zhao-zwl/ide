@@ -15,7 +15,10 @@ use ide_core::collab::{
 };
 use ide_core::security::PgSecretStore;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+// 只需 `AppHandle`（用于函数签名）。`Manager` trait 方法（.state() 等）由
+// `current_vendor(app)`（在 domain/mod.rs 内）间接使用，本模块不直接调用，
+// 故不 `use tauri::Manager`，避免 unused_imports 警告。
+use tauri::AppHandle;
 
 /// 选取 comment 存储：优先 bundled PG，不可达时回退内存（不持久化）。
 async fn comment_store(app: &AppHandle) -> Arc<dyn CommentStore> {
