@@ -7,7 +7,6 @@ use crate::error::GuiError;
 use crate::ipc::BootstrapPhase;
 use crate::state::AppState;
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -30,7 +29,10 @@ pub async fn start(app: &AppHandle) -> Result<(), GuiError> {
             &["serve"],
             &[("OLLAMA_MODELS".to_string(), models_env.clone())],
         )?;
-        app.state::<AppState>().bootstrap.lock().unwrap().ollama = Some(child);
+        // 显式块隔离：MutexGuard 不是 Send，紧接着就是 .await。
+        {
+            app.state::<AppState>().bootstrap.lock().unwrap().ollama = Some(child);
+        }
         wait_ollama_ready().await?;
         emit_progress(app, BootstrapPhase::Ollama, 0.5, Some("Ollama 就绪"));
     }

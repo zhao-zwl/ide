@@ -5,7 +5,8 @@
 //! 拉起，仅补建库/角色/迁移，保证两种形态都能工作。
 
 use crate::bootstrap::emit_progress;
-use crate::bootstrap::sidecar::{app_data_dir, bin_path, resource_path, spawn_binary};
+// 注：pg 用自己的 `spawn_pg_ctl`（需定制 -o 参数），不走通用 `spawn_binary`。
+use crate::bootstrap::sidecar::{app_data_dir, bin_path, resource_path};
 use crate::error::GuiError;
 use crate::ipc::BootstrapPhase;
 use crate::state::AppState;
@@ -47,7 +48,10 @@ pub async fn init_and_start(app: &AppHandle) -> Result<(), GuiError> {
     let log = pgdata.join("postgres.log");
     let pg_ctl = spawn_pg_ctl(&pg_ctl_bin, &postgres_bin, &pgdata, &log)?;
     // pg_ctl 会 fork 出 postgres 并退出；此处把 pg_ctl 句柄存下（监管用）。
-    app.state::<AppState>().bootstrap.lock().unwrap().pg = Some(pg_ctl);
+    // 显式块隔离：MutexGuard 不是 Send，紧接着就是 .await。
+    {
+        app.state::<AppState>().bootstrap.lock().unwrap().pg = Some(pg_ctl);
+    }
 
     wait_pg_ready(app).await?;
     ensure_db_and_role(app)?;
