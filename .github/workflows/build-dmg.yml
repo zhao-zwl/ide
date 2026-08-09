@@ -153,6 +153,8 @@ jobs:
           # GitHub 默认 bash 是 `bash -eo pipefail`，-e 始终开着。显式关掉 -e，
           # 保留 pipefail 以便正确取退出码；重试逻辑自行判断 rc。
           set +e -o pipefail
+          # 该 trap 只用于「真正意外」的失败。所有**诊断性**命令必须显式 `|| true`，
+          # 否则会像 run #13 那样报出一条说不清的 FETCH_UNCAUGHT 干扰后续排查。
           trap 'echo "::error::FETCH_UNCAUGHT rc=$? line=$LINENO"' ERR
 
           echo "disk before: $(df -h / | tail -1)"
@@ -246,7 +248,13 @@ jobs:
 
           echo "disk after: $(df -h / | tail -1)"
           echo "--- osxcross/bin (head) ---"
-          ls "$OSXCROSS_ROOT/bin" | head -40
+          # `ls | head -40`：head 读满 40 行就关闭管道，GNU coreutils 的 ls 遇到
+          # EPIPE 会打印 "write error: Broken pipe" 并以 rc=2 退出；叠加 pipefail
+          # 后整条管线 rc=2，触发上面的 ERR trap ⇒ run #13 里那条
+          # `FETCH_UNCAUGHT rc=2 line=97`（脚本第 97 行正是本行）。
+          # 本步骤 set +e，所以 step 结论仍是 success —— 一条自相矛盾的 failure 注解。
+          # 这是纯诊断输出，显式吞掉退出码即可（`|| true` 同时抑制 ERR trap）。
+          { ls "$OSXCROSS_ROOT/bin" 2>/dev/null | head -40; } || true
           echo "--- SDK ---"
           ls -d "$OSXCROSS_ROOT"/SDK/* || true
 
@@ -349,6 +357,67 @@ jobs:
             chmod +x "$f"
           done
           ls -la gui/src-tauri/bin
+
+      # -------------------------------------------------------------------
+      # 快速前端检查：在昂贵的下载 / 构建之前，先用 cargo check 把 Rust 侧的
+      # 编译期错误一次性抖出来。
+      #
+      # 为什么卡在这个位置（前后都不能挪）：
+      #   * 必须在 "Configure cross-compilation environment" 之后 —— 那一步把
+      #     CC_/AR_/RANLIB_/LINKER/SDKROOT 写进 $GITHUB_ENV，后续步骤才继承得到；
+      #   * 必须在 "Build frontend" + "Create sidecar placeholders" 之后 ——
+      #     tauri-build 的 build.rs 会校验 frontendDist 与 externalBin 是否存在，
+      #     少任何一个都会报出与真实代码无关的假错误；
+      #   * 又必须在 ollama / PostgreSQL / 模型权重三个大下载之前 —— 一旦 Rust
+      #     编不过，那几百 MB 下载（模型权重单条 --max-time 900）加几十分钟的
+      #     LTO release 构建就全白跑了。
+      #
+      # 能力边界：cargo check 只做到类型检查 / 名字解析（产出 .rmeta，不做
+      # codegen），因此拦得住 E0255/E0432/E0425/E0117 这类错误，拦不住链接期
+      # 错误 —— 后者仍由下面的 "Cross-compile Rust" 步骤兜底。
+      # -------------------------------------------------------------------
+      - name: Fast frontend check (cargo check, fail early with annotations)
+        run: |
+          # 与其它加固步骤一致：显式关 -e，保留 pipefail 以便取管道退出码。
+          set +e -o pipefail
+          # 诊断命令一律 `|| true`，否则会误触发这个 trap（参见 fetch 步骤的
+          # `ls | head` EPIPE 教训）。
+          trap 'echo "::error::CHECK_UNCAUGHT rc=$? line=$LINENO"' ERR
+
+          CHECK_LOG=/tmp/cargo-check.log
+          : > "$CHECK_LOG"
+
+          echo "::group::cargo check --release --target ${TARGET_TRIPLE} --message-format=short"
+          # 放进 if 条件里执行：bash 不会为「条件上下文中的命令」触发 ERR trap，
+          # 从而避免失败时先冒出一条自相矛盾的 CHECK_UNCAUGHT 注解。
+          rc=0
+          if ! cargo check --release --target "$TARGET_TRIPLE" \
+                 -p aidea -p aidea-gui \
+                 --message-format=short 2>&1 | tee -a "$CHECK_LOG"; then
+            rc="${PIPESTATUS[0]}"
+            # 万一是 tee 失败而 cargo 成功，也要保证 rc 非 0
+            if [ "$rc" -eq 0 ]; then rc=1; fi
+          fi
+          echo "::endgroup::"
+
+          if [ "$rc" -ne 0 ]; then
+            bash scripts/ci/annotate-cargo-errors.sh "$CHECK_LOG" cargo_check
+            echo "::error::cargo_check_failed rc=$rc —— Rust 侧编译错误，已跳过后续下载与 release 构建。逐条 file:line 见上面的 cargo_check[batch N] 注解。"
+            exit "$rc"
+          fi
+
+          echo "cargo check 通过：类型 / 名字解析层面无错误（链接期错误仍需 release 构建验证）。"
+          # -e 已关闭，显式以 0 结束，避免最后一条命令的退出码误判本步骤
+          exit 0
+
+      - name: Upload cargo check log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-check-log
+          path: /tmp/cargo-check.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       # -------------------------------------------------------------------
       - name: Download ollama macOS binary
@@ -525,35 +594,45 @@ jobs:
           CARGO_LOG=/tmp/cargo-cross.log
           : > "$CARGO_LOG"
 
+          # --message-format=short 让 rustc 把诊断压成单行
+          # `path/to/f.rs:12:34: error[E0425]: ...`，注解里才留得住 file:line。
+          # 链接期错误（ld/clang）不受该开关影响，仍是原样多行输出，由注解脚本
+          # 的链接期正则单独捕获。
           build() {
-            cargo build --release --target "$TARGET_TRIPLE" -p aidea -p aidea-gui
+            cargo build --release --target "$TARGET_TRIPLE" -p aidea -p aidea-gui \
+              --message-format=short
           }
 
-          # job 日志与 artifact 都需要鉴权才能读，annotations 则是公开可读的。
-          # 因此把 CARGO_LOG 里的关键错误行压成单行，用 ::error:: 注解暴露出来。
+          # job 日志与 artifact 都要鉴权才能读，只有 annotations 是公开可读的。
+          # 旧实现把 tail -60 压成**一条**注解，file:line 全被挤掉、错误被截断，
+          # 只能靠 CI 往返挤牙膏。现统一交给 scripts/ci/annotate-cargo-errors.sh
+          # 分批输出（该脚本恒以 0 退出，绝不会因诊断本身把步骤带挂）。
           emit_cargo_error() {
-            excerpt="$(grep -aE 'error\[|error:|panic|cannot find|undefined symbol|framework not found|ld:|linker' "$CARGO_LOG" | tail -n 60)"
-            if [ -z "$excerpt" ]; then
-              excerpt="$(tail -n 60 "$CARGO_LOG")"
-            fi
-            excerpt="$(printf '%s' "$excerpt" | tr '\r\n\t' '   ' | tr -s ' ' | cut -c1-4000)"
-            echo "::error::cargo_build ${excerpt}"
+            bash scripts/ci/annotate-cargo-errors.sh "$CARGO_LOG" cargo_build
           }
 
+          # 两轮构建都放进 if 条件里：bash 不会为「条件上下文中的命令」触发 ERR
+          # trap，避免失败时先冒出一条自相矛盾的 CARGO_UNCAUGHT 注解。
           echo "::group::attempt 1 (repo release profile: lto=true, codegen-units=1)"
-          build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo1.log
-          rc=${PIPESTATUS[0]}
+          rc=0
+          if ! build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo1.log; then
+            rc="${PIPESTATUS[0]}"
+            if [ "$rc" -eq 0 ]; then rc=1; fi
+          fi
           echo "::endgroup::"
           if [ "$rc" -eq 0 ]; then
             echo "ok"
           else
             echo "::warning::带 LTO 的构建失败（runner 常见 OOM），关闭 LTO 重试"
             echo "::group::attempt 2 (lto=off, codegen-units=256)"
-            CARGO_PROFILE_RELEASE_LTO=false \
-            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
-            CARGO_PROFILE_RELEASE_INCREMENTAL=false \
-              build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo2.log
-            rc=${PIPESTATUS[0]}
+            rc=0
+            if ! CARGO_PROFILE_RELEASE_LTO=false \
+                 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
+                 CARGO_PROFILE_RELEASE_INCREMENTAL=false \
+                 build 2>&1 | tee -a "$CARGO_LOG" /tmp/cargo2.log; then
+              rc="${PIPESTATUS[0]}"
+              if [ "$rc" -eq 0 ]; then rc=1; fi
+            fi
             echo "::endgroup::"
           fi
 
