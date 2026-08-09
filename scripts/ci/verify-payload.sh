@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# =============================================================================
+# verify-payload.sh — 三大下载（ollama / PostgreSQL / 端模型权重）的产物分项断言
+#
+# 【为什么需要它】
+#   run #16 里 step 19 ollama 4s、step 20 PostgreSQL 4s、step 21 模型权重 11s，
+#   三步全 success，最终 artifact 586.22 MiB。但这三步的失败路径**全部是
+#   `::warning::` + `exit 0`**（见 build-dmg.yml）——也就是说：
+#     · ollama 下载失败   → warning，步骤仍 success，包里没有 ollama
+#     · Postgres 下载失败 → warning，步骤仍 success，包里没有数据库
+#     · 权重下载失败      → warning，步骤仍 success，包里没有模型
+#   586 MiB 这个总量**无法归因到具体哪一项**，所以「三步全绿」并不能证明
+#   三样东西都在包里。本脚本把「隐式的 warning」变成「显式的分项断言」。
+#
+# 【断言策略】
+#   ollama / PostgreSQL  → 缺失即**硬失败**（后端栈必需，缺了 App 起不来）
+#   模型权重             → 维持 best-effort，但**必须在注解里区分 BAKED / SKIPPED**，
+#                          绝不静默 success；若文件存在却损坏（魔数错/截断）
+#                          则硬失败 —— 发一个坏模型比不发更糟。
+#
+# 【体积下限的取法】
+#   全部取「远低于真实体积」的保守值，目的只是挡住空文件 / HTML 错误页 /
+#   截断 / 占位脚本，因此不存在误杀正常产物的风险。上游实测参考值：
+#     ollama-darwin.tgz     138.7 MiB（v0.32.6，解包后 ollama 本体数十 MiB）
+#     Postgres-2.9.5-17.dmg 114.0 MiB
+#     qwen2.5-0.5b q4_k_m   约 400 MiB
+#
+# 用法:
+#   verify-payload.sh <bundle_dir> <model_gguf_path>
+#   verify-payload.sh --self-test
+# =============================================================================
+
+set -uo pipefail   # 不开 -e：由脚本自己收敛退出码
+
+: "${TARGET_TRIPLE:=x86_64-apple-darwin}"
+
+# ---- 体积下限（字节）。可用环境变量覆盖，便于将来调参而不改脚本。----------
+: "${MIN_OLLAMA_BYTES:=8388608}"      #  8 MiB —— ollama 本体
+: "${MIN_PGTOOL_BYTES:=32768}"        # 32 KiB —— 单个 pg 可执行文件
+: "${MIN_PGSHARE_BYTES:=1048576}"     #  1 MiB —— initdb 模板/时区数据
+: "${MIN_PGLIB_BYTES:=1048576}"       #  1 MiB —— libpq 等 dylib
+: "${MIN_MODEL_BYTES:=67108864}"      # 64 MiB —— 端模型权重
+
+# -----------------------------------------------------------------------------
+# 工具函数（POSIX 友好：du -sk 在 Linux/macOS 上行为一致，便于本地自测）
+# -----------------------------------------------------------------------------
+file_size() { [ -f "$1" ] || { echo 0; return; }; wc -c < "$1" 2>/dev/null | tr -d ' []' ; }
+dir_bytes() { [ -d "$1" ] || { echo 0; return; }; du -sk "$1" 2>/dev/null | awk '{print $1*1024; exit}'; }
+human()     { awk -v b="${1:-0}" 'BEGIN{ if (b >= 1048576) printf "%.1fMB", b/1048576; else printf "%.0fKB", b/1024 }'; }
+
+# -----------------------------------------------------------------------------
+main() {
+  local BUNDLE="${1:-.bundle}"
+  local MODEL="${2:-}"
+  local n_fail=0
+
+  echo "::group::payload inventory (${BUNDLE})"
+  ls -lhR "$BUNDLE" 2>/dev/null | head -80 || true
+  echo "::endgroup::"
+
+  # =========================================================================
+  # C2-a  ollama —— 缺失硬失败
+  # =========================================================================
+  local ollama_bin ollama_sz ollama_runner_sz ollama_rep
+  ollama_bin="${BUNDLE}/bin/ollama-${TARGET_TRIPLE}"
+  ollama_sz="$(file_size "$ollama_bin")"
+  ollama_runner_sz="$(dir_bytes "${BUNDLE}/lib/ollama")"
+
+  echo "--- ollama ---"
+  ls -lh "$ollama_bin" 2>/dev/null || echo "  (缺失: $ollama_bin)"
+
+  if [ ! -f "$ollama_bin" ]; then
+    echo "::error::payload_check ollama: MISSING — ${ollama_bin} 不存在。上游 ollama release 已不再提供单文件 ollama-darwin 资产（v0.32.6 仅有 ollama-darwin.tgz），若 tarball 分支也未命中就会静默留空。缺 ollama ⇒ 端模型对话完全不可用。"
+    n_fail=$((n_fail + 1))
+    ollama_rep="MISSING"
+  elif [ "$ollama_sz" -lt "$MIN_OLLAMA_BYTES" ]; then
+    echo "::error::payload_check ollama: TOO SMALL — 实际 ${ollama_sz} B（$(human "$ollama_sz")）低于下限 ${MIN_OLLAMA_BYTES} B（$(human "$MIN_OLLAMA_BYTES")）。疑似下到 HTML 错误页或文件被截断。"
+    n_fail=$((n_fail + 1))
+    ollama_rep="CORRUPT($(human "$ollama_sz"))"
+  else
+    ollama_rep="$(human "$ollama_sz")"
+    [ "$ollama_runner_sz" -gt 0 ] && ollama_rep="${ollama_rep}+runners$(human "$ollama_runner_sz")"
+  fi
+
+  # =========================================================================
+  # C2-b  PostgreSQL —— 四个 sidecar + lib + share，缺失硬失败
+  # =========================================================================
+  local pg_total=0 t tp tsz missing_pg=""
+  echo "--- postgresql ---"
+  for t in postgres initdb pg_ctl psql; do
+    tp="${BUNDLE}/bin/${t}-${TARGET_TRIPLE}"
+    tsz="$(file_size "$tp")"
+    if [ ! -f "$tp" ]; then
+      missing_pg="${missing_pg:+$missing_pg,}${t}"
+    elif [ "$tsz" -lt "$MIN_PGTOOL_BYTES" ]; then
+      missing_pg="${missing_pg:+$missing_pg,}${t}(too-small:${tsz}B)"
+    else
+      pg_total=$((pg_total + tsz))
+    fi
+    ls -lh "$tp" 2>/dev/null || echo "  (缺失: ${t})"
+  done
+
+  local pg_lib_sz pg_share_sz pg_rep
+  # .bundle/lib 里混着 ollama 的 runner 子目录，统计 postgres dylib 时排除它
+  pg_lib_sz="$(( $(dir_bytes "${BUNDLE}/lib") - ollama_runner_sz ))"
+  [ "$pg_lib_sz" -lt 0 ] && pg_lib_sz=0
+  pg_share_sz="$(dir_bytes "${BUNDLE}/share")"
+  echo "  lib(pg only) = $(human "$pg_lib_sz")   share = $(human "$pg_share_sz")"
+
+  if [ -n "$missing_pg" ]; then
+    echo "::error::payload_check postgres: MISSING/BAD sidecars = [${missing_pg}]。Postgres.app dmg 下载或 7z 解包未成功（该步骤所有失败路径都是 warning+exit 0，因此步骤会假绿）。缺 postgres/initdb ⇒ App 启动即报数据库不可用。"
+    n_fail=$((n_fail + 1))
+  fi
+  if [ "$pg_share_sz" -lt "$MIN_PGSHARE_BYTES" ]; then
+    echo "::error::payload_check postgres: share/ 过小 — 实际 $(human "$pg_share_sz") 低于下限 $(human "$MIN_PGSHARE_BYTES")。initdb 依赖 share 里的模板与时区数据，缺失则数据库无法初始化。"
+    n_fail=$((n_fail + 1))
+  fi
+  if [ "$pg_lib_sz" -lt "$MIN_PGLIB_BYTES" ]; then
+    echo "::error::payload_check postgres: lib/ 过小 — 实际 $(human "$pg_lib_sz") 低于下限 $(human "$MIN_PGLIB_BYTES")。pg 可执行文件用 @loader_path/../lib 找 dylib，缺失则一启动就 'Library not loaded'。"
+    n_fail=$((n_fail + 1))
+  fi
+  # initdb 没有 postgres.bki 就跑不起来。布局可能随上游变动，故仅告警不阻断。
+  if [ -d "${BUNDLE}/share" ] && ! find "${BUNDLE}/share" -name 'postgres.bki' -print -quit 2>/dev/null | grep -q .; then
+    echo "::warning::payload_check postgres: 在 share/ 下未找到 postgres.bki（initdb 引导必需）。若用户侧 initdb 失败，优先查这里。"
+  fi
+  pg_rep="bin$(human "$pg_total")+lib$(human "$pg_lib_sz")+share$(human "$pg_share_sz")"
+  [ -n "$missing_pg" ] && pg_rep="MISSING[${missing_pg}]"
+
+  # =========================================================================
+  # C2-c  端模型权重 —— best-effort，但必须显式区分 BAKED / SKIPPED
+  # =========================================================================
+  local model_sz model_rep magic
+  model_sz="$(file_size "$MODEL")"
+  echo "--- model weights ---"
+  ls -lh "$MODEL" 2>/dev/null || echo "  (未烘焙: $MODEL)"
+
+  if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
+    model_rep="SKIPPED"
+    echo "::warning::payload_check model_weights=SKIPPED — 端模型权重未烘焙进包。这是**设计上允许的降级路径**：用户首次启动时由 ollama 联网拉取 qwen2.5:0.5b（见 Modelfile）。代价是首启需要联网且要等一次几百 MB 下载，「零配置离线对话」这一核心卖点在首启前不成立。"
+  else
+    magic="$(head -c 4 "$MODEL" 2>/dev/null | tr -d '\0')"
+    if [ "$magic" != "GGUF" ]; then
+      echo "::error::payload_check model_weights: CORRUPT — 文件存在但魔数不是 GGUF（实际前 4 字节 ='${magic}'）。发一个坏模型比不发更糟，硬失败。"
+      n_fail=$((n_fail + 1)); model_rep="CORRUPT"
+    elif [ "$model_sz" -lt "$MIN_MODEL_BYTES" ]; then
+      echo "::error::payload_check model_weights: TRUNCATED — 实际 ${model_sz} B（$(human "$model_sz")）远低于 qwen2.5-0.5b q4_k_m 的预期量级（约 400MB，下限 $(human "$MIN_MODEL_BYTES")）。"
+      n_fail=$((n_fail + 1)); model_rep="TRUNCATED($(human "$model_sz"))"
+    else
+      model_rep="BAKED($(human "$model_sz"))"
+    fi
+  fi
+
+  # =========================================================================
+  # 汇总注解：无条件打印，下一轮可直接从注解读事实，不必猜
+  # =========================================================================
+  local total
+  total=$(( $(dir_bytes "$BUNDLE") + model_sz ))
+  echo "::notice::payload_check ollama=${ollama_rep} postgres=${pg_rep} model_weights=${model_rep} total=$(human "$total")"
+
+  if [ "$n_fail" -ne 0 ]; then
+    echo "::error::payload_check: 共 ${n_fail} 条断言失败 —— 在昂贵的交叉编译之前中止，避免白烧一轮。"
+    return 1
+  fi
+  echo "payload_check: 全部断言通过"
+  return 0
+}
+
+# =============================================================================
+# 自测：造一棵假的 .bundle 树，覆盖「齐全 / 缺 ollama / 缺 pg / 模型损坏」四种形态
+# =============================================================================
+self_test() {
+  local pass=0 fail=0 tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  _mk() {  # $1=path $2=KiB
+    mkdir -p "$(dirname "$1")"
+    dd if=/dev/zero of="$1" bs=1024 count="$2" >/dev/null 2>&1
+  }
+  _expect() {
+    if [ "$2" = "$3" ]; then printf '  [PASS] %-42s => rc=%s\n' "$1" "$3"; pass=$((pass+1))
+    else printf '  [FAIL] %-42s expected rc=%s actual rc=%s\n' "$1" "$2" "$3"; fail=$((fail+1)); fi
+  }
+
+  # --- 形态 1：一切齐全 ---
+  local B="$tmp/full"
+  _mk "$B/bin/ollama-${TARGET_TRIPLE}" 10240          # 10 MiB
+  _mk "$B/bin/postgres-${TARGET_TRIPLE}" 512
+  _mk "$B/bin/initdb-${TARGET_TRIPLE}" 256
+  _mk "$B/bin/pg_ctl-${TARGET_TRIPLE}" 256
+  _mk "$B/bin/psql-${TARGET_TRIPLE}" 256
+  _mk "$B/lib/libpq.5.dylib" 2048
+  _mk "$B/share/postgresql/postgres.bki" 2048
+  local M="$tmp/model.gguf"
+  printf 'GGUF' > "$M"; dd if=/dev/zero bs=1024 count=70000 >> "$M" 2>/dev/null   # ~68 MiB
+  main "$B" "$M" >/dev/null 2>&1; _expect "全部齐全" 0 "$?"
+
+  # --- 形态 2：缺 ollama（硬失败）---
+  local B2="$tmp/noollama"; cp -a "$B" "$B2"; rm -f "$B2/bin/ollama-${TARGET_TRIPLE}"
+  main "$B2" "$M" >/dev/null 2>&1; _expect "缺 ollama ⇒ 硬失败" 1 "$?"
+
+  # --- 形态 3：缺 postgres sidecar（硬失败）---
+  local B3="$tmp/nopg"; cp -a "$B" "$B3"; rm -f "$B3/bin/initdb-${TARGET_TRIPLE}"
+  main "$B3" "$M" >/dev/null 2>&1; _expect "缺 initdb ⇒ 硬失败" 1 "$?"
+
+  # --- 形态 4：pg share 为空（硬失败）---
+  local B4="$tmp/noshare"; cp -a "$B" "$B4"; rm -rf "$B4/share"; mkdir -p "$B4/share"
+  main "$B4" "$M" >/dev/null 2>&1; _expect "pg share 空 ⇒ 硬失败" 1 "$?"
+
+  # --- 形态 5：模型缺失（best-effort，仍应通过）---
+  main "$B" "$tmp/nonexistent.gguf" >/dev/null 2>&1; _expect "模型缺失 ⇒ best-effort 放行" 0 "$?"
+  # SKIPPED 会出现两次（解释性 ::warning:: + 汇总 ::notice::），这里只校验汇总注解
+  local out
+  out="$(main "$B" "$tmp/nonexistent.gguf" 2>&1 | grep -c '^::notice::payload_check .*model_weights=SKIPPED')"
+  _expect "汇总注解含 model_weights=SKIPPED" 1 "$out"
+  out="$(main "$B" "$tmp/nonexistent.gguf" 2>&1 | grep -c '^::warning::payload_check model_weights=SKIPPED')"
+  _expect "另有 warning 解释降级后果" 1 "$out"
+
+  # --- 形态 6：模型魔数错（硬失败）---
+  local BAD="$tmp/bad.gguf"; printf '<!DOCTYPE html>' > "$BAD"
+  dd if=/dev/zero bs=1024 count=70000 >> "$BAD" 2>/dev/null
+  main "$B" "$BAD" >/dev/null 2>&1; _expect "模型魔数错 ⇒ 硬失败" 1 "$?"
+
+  # --- 形态 7：模型截断（硬失败）---
+  local TR="$tmp/trunc.gguf"; printf 'GGUF' > "$TR"; dd if=/dev/zero bs=1024 count=100 >> "$TR" 2>/dev/null
+  main "$B" "$TR" >/dev/null 2>&1; _expect "模型截断 ⇒ 硬失败" 1 "$?"
+
+  # --- 形态 8：BAKED 注解正确 ---
+  out="$(main "$B" "$M" 2>&1 | grep -c '^::notice::payload_check .*model_weights=BAKED')"
+  _expect "汇总注解含 model_weights=BAKED" 1 "$out"
+
+  echo
+  echo "self-test: ${pass} passed, ${fail} failed"
+  [ "$fail" -eq 0 ]
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  self_test
+  exit $?
+fi
+main "$@"
+exit $?
