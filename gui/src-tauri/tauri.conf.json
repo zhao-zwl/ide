@@ -51,7 +51,7 @@
       "bin/psql"
     ],
     "macOS": {
-      "minimumSystemVersion": "10.15",
+      "minimumSystemVersion": "14.0",
       "signingIdentity": null,
       "hardened-runtime": false,
       "dmg": {
