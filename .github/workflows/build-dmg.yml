@@ -513,7 +513,7 @@ jobs:
       # -------------------------------------------------------------------
       - name: Download ollama macOS binary
         env:
-          OLLAMA_VERSION: v0.32.6
+          OLLAMA_VERSION: v0.21.0
         run: |
           set -euo pipefail
           mkdir -p .bundle/bin .bundle/lib
@@ -524,8 +524,15 @@ jobs:
           # 60 req/h/IP，CI runner 共享 IP 极易触发 403 → ASSETS='{}' →
           # TGZ 为空 → 二进制从不拷贝 → 被 payload 门禁判 MISSING（run #18）。
           # 改用 releases/download/<tag>/<asset> 直链：匿名可下、无速率限制。
-          # v0.32.6 仅有 ollama-darwin.tgz（单文件 ollama-darwin 已 404），
+          # 该 release 仅有 ollama-darwin.tgz（单文件 ollama-darwin 已 404），
           # 故只保留 tarball 路径；如需换版本改上方 OLLAMA_VERSION 即可。
+          #
+          # ---- 为什么从 v0.32.6 回退到 v0.21.0（最低系统版本）--------------
+          # v0.32.6 的 ollama 二进制 LC_BUILD_VERSION minos=14.0，用户实测机是
+          # macOS 13 (Ventura) ⇒ dyld 直接拒绝加载，端模型完全不可用。
+          # v0.21.0 早于上游把 deployment target 抬到 14.0，且仍带
+          # ollama-darwin.tgz 资产。真实 minos 由本轮 CI 的
+          # `verify-macho --sidecar` 实证读出确认 ≤13，不靠猜。
           TGZ="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-darwin.tgz"
 
           got=0
@@ -583,7 +590,13 @@ jobs:
                 if [ -n "$LIBDIR" ]; then
                   rsync -a "$LIBDIR/" .bundle/lib/ollama/
                 else
-                  rsync -a --exclude='/ollama' "$WORK/x"/ .bundle/lib/ollama/
+                  # 额外排除 mlx_metal_v3/v4：MLX Metal runner 只在 Apple
+                  # Silicon 上可用，Intel 目标机永远加载不到，白占 ~293MB。
+                  # 若该版本归档里根本没有 mlx_metal_*，exclude 是空操作、无害。
+                  rsync -a --exclude='/ollama' \
+                           --exclude='/mlx_metal_v3' \
+                           --exclude='/mlx_metal_v4' \
+                           "$WORK/x"/ .bundle/lib/ollama/
                 fi
                 echo "bundled ollama runners: $(du -sh .bundle/lib/ollama | cut -f1)"
                 # 不接 head：本步骤 set -o pipefail，head 提前退出会让上游吃
