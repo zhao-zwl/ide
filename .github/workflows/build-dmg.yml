@@ -565,6 +565,17 @@ jobs:
                 cp "$BIN" ".bundle/bin/ollama-${TARGET_TRIPLE}"
                 got=1
 
+                # ---- run #22 新增：就地改写 ollama 二进制 minos 14.0 -> 11.0 -----
+                # 用户真机是 macOS 13 (Ventura)，ollama v0.21.0 的 LC_BUILD_VERSION
+                # minos=14.0 会被 dyld 拒绝加载。在打包前就地改写二进制里的 minos
+                # 字段（仅改 dyld 加载门槛，不改运行时 API 调用），让 dyld 放行。
+                # 补丁在 chmod 与随 .app 的 ad-hoc codesign 之前执行，改写字节不会
+                # 破坏我们依赖的签名（ollama 二进制在 CI 里本就未被单独 codesign）。
+                # 真机能否真正加载只能由用户在 macOS 13 的 Intel Mac 上验证；
+                # CI 只负责把补丁做进产物并让注解可证明 minos 已被改写。
+                python3 scripts/ci/patch-macos-minos.py ".bundle/bin/ollama-${TARGET_TRIPLE}" 11.0
+                echo "::notice::patched ollama minos 14.0 -> 11.0 (user macOS 13 workaround)"
+
                 # ---- runner 落盘：兼容「嵌套」与「全平铺」两种上游布局 --------
                 # ollama 运行时固定按 <exe>/../lib/ollama 找 runner，所以不管
                 # 上游怎么摆，进包后都必须落成 .bundle/lib/ollama/。

@@ -62,6 +62,8 @@ set -uo pipefail   # 故意不开 -e：所有断言由脚本自己收敛成最�
 # ---- 体积下限。取值远低于真实体积，只为挡住空文件 / 截断 / 占位脚本。--------
 : "${MACHO_MIN_BYTES:=2097152}"    # 2 MiB —— strict 模式（我们自己编的两个）
 : "${SIDECAR_MIN_BYTES:=16384}"    # 16 KiB —— sidecar 模式（pg 工具本就小）
+: "${BUNDLE_MIN_MACOS:=11.0}"      # sidecar B2 比较基准：本包声明的真实最低系统
+                                   # （打过 minos 补丁后，ollama 真实下限=11.0，不再与 10.15 比）
 
 # ---- 路径泄漏黑名单（B3）-----------------------------------------------------
 LEAK_RE='(^|/)osxcross(/|$)|^/home/|^/github/|^/builds/|^/__w/|^/tmp/|^/opt/|^/root/|^/mnt/|^/var/lib/'
@@ -907,10 +909,13 @@ main() {
     if [ "$sidecar" = "1" ]; then
       # sidecar：只打印、不 gate。上游 deployment target 不归我们管，
       #          拿 10.15 硬 gate 会误杀。但高于目标时给一条 warning。
+      # ⚠️ 比较基准用 BUNDLE_MIN_MACOS（默认 11.0）而非 expect_minos(=10.15)：
+      #   打过 minos 补丁后，ollama 等 sidecar 的真实下限=11.0，若仍拿 10.15
+      #   去比，会把它「高于本包宣称值」误报出来（run #22 修复点）。
       if [ "$lc" = "NONE" ] || [ "$minos" = "?" ]; then
         echo "::warning::${tag} ${label}: B2 INFO — 未找到 LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX，无法判定 deployment target（仅记录，不阻断）。"
-      elif ver_gt "$(norm_ver "$minos")" "$(norm_ver "$expect_minos")"; then
-        echo "::warning::${tag} ${label}: B2 INFO — 上游 minos=${minos} **高于**本包宣称的 ${expect_minos}。该 sidecar 在低于 macOS ${minos} 的机器上会被 dyld 拒绝启动，意味着「本包实际可用的最低系统」被这个上游件抬到了 ${minos}。不 gate（上游 deployment target 非我方可控），但 Info.plist 的 LSMinimumSystemVersion 与对外说明需要据此校准。"
+      elif ver_gt "$(norm_ver "$minos")" "$(norm_ver "$BUNDLE_MIN_MACOS")"; then
+        echo "::warning::${tag} ${label}: B2 INFO — 上游 minos=${minos} **高于**本包宣称的 ${BUNDLE_MIN_MACOS}。该 sidecar 在低于 macOS ${minos} 的机器上会被 dyld 拒绝启动，意味着「本包实际可用的最低系统」被这个上游件抬到了 ${minos}。不 gate（上游 deployment target 非我方可控），但 Info.plist 的 LSMinimumSystemVersion 与对外说明需要据此校准。"
       fi
     else
       # strict：硬失败。链接成功 ≠ deployment target 生效。
