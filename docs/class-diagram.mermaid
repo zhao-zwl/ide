@@ -1,4 +1,6 @@
-%% aidea 自包含 .dmg GUI — 类 / 接口图
+%% aidea 自包含 .dmg GUI — 类 / 接口图（增量：Ollama → llama.cpp llama-server）
+%% 变更点：OllamaBoot → LlamaCppBoot；新增 LlamaCppServer sidecar；
+%%          本地推理后端 Local 复用 OpenAiLlm / OpenAiCompletionBackend（指向 127.0.0.1 的 llama-server）。
 
 classDiagram
     direction LR
@@ -20,7 +22,7 @@ classDiagram
     }
     class BootstrapHandles {
         +pg: Child
-        +ollama: Child
+        +llamacpp: Child
         +serve: Child
         +phase: Mutex~BootstrapPhase~
     }
@@ -38,12 +40,14 @@ classDiagram
     class Sidecar {
         +spawn(name, args, env) Child
         +supervise(child)
+        +bin_path(name) PathBuf
     }
     class PgBoot {
         +initdb_if_needed() +start() +createdb() +apply_migrations()
     }
-    class OllamaBoot {
-        +start() +create_model("nes-tab", FROM qwen2.5:0.5b)
+    class LlamaCppBoot {
+        +start()  %% 启动 llama-server --model <gguf> --host 127.0.0.1 --port <p>
+        +wait_ready()  %% 轮询端口
     }
     class ServeBoot {
         +start_with_env(vendor) +wait_health()
@@ -51,6 +55,15 @@ classDiagram
     class ModelBackend {
         +to_serve_env(cfg) Vec~(String,String)~
         +test_vendor(base_url, key) bool
+    }
+
+    %% ---------- 新：llama.cpp sidecar ----------
+    class LlamaCppServer {
+        <<sidecar: llama-server>>
+        +port: u16 = 8080
+        +model_path: GGUF
+        +base_url: http://127.0.0.1:8080/v1
+        +OpenAI 兼容: /v1/chat/completions /v1/completions /v1/embeddings /health
     }
 
     %% ---------- Rust 端：Tauri Commands ----------
@@ -86,6 +99,31 @@ classDiagram
         +collab / security::PgSecretStore / CoreConfig
     }
 
+    %% ---------- 服务端推理后端（ide-core，复用既有 OpenAI 兼容实现） ----------
+    class LlmBackend {
+        <<enum>>
+        +Mock / Local / OpenAi
+    }
+    class NesBackend {
+        <<enum>>
+        +Mock / Local / OpenAi
+    }
+    class OpenAiLlm {
+        +base_url +api_key +model
+        +impl Llm: think()/plan_action()
+        %% Local 模式：base_url=http://127.0.0.1:8080/v1，api_key=""
+    }
+    class OpenAiCompletionBackend {
+        +base_url +api_key +model
+        +impl CompletionBackend: complete()
+        %% Local 模式：base_url=http://127.0.0.1:8080/v1
+    }
+    class NesClient {
+        +cache +degradation +batch
+        +with_backend(Arc~dyn CompletionBackend~)
+        +embed()  %% 走 llama-server /v1/embeddings（可选）
+    }
+
     %% ---------- 前端 ----------
     class ModelStore { +vendor +setVendor()/test() }
     class ConnectionStore { +status +bootstrap }
@@ -115,7 +153,7 @@ classDiagram
 
     Bootstrap ..> Sidecar
     Bootstrap ..> PgBoot
-    Bootstrap ..> OllamaBoot
+    Bootstrap ..> LlamaCppBoot
     Bootstrap ..> ServeBoot
     ModelBackend ..> ServeBoot : env
     ServeBoot ..> IdeCore : 启动 aidea serve
@@ -123,6 +161,16 @@ classDiagram
     QuestService ..> IdeCoreDomain
     CraftService ..> IdeCoreDomain
     CollabService ..> IdeCoreDomain
+
+    LlamaCppBoot ..> Sidecar : spawn llama-server
+    LlamaCppBoot ..> LlamaCppServer : HTTP /v1/*
+    IdeCore ..> OpenAiLlm : Local 走 /v1/chat/completions
+    IdeCore ..> NesClient : Local 走 OpenAiCompletionBackend
+    NesClient o-- OpenAiCompletionBackend
+    OpenAiLlm ..> LlamaCppServer : /v1/chat/completions
+    OpenAiCompletionBackend ..> LlamaCppServer : /v1/chat|completions
+    LlmBackend <.. OpenAiLlm : Local 构造
+    NesBackend <.. NesClient : Local 构造
 
     Pages ..> InvokeApi
     InvokeApi ..> Commands

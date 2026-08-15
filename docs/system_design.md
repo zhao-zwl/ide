@@ -307,3 +307,193 @@ graph TD
 ```
 
 > 说明：T02/T03 仅依赖 T01，可并行；T04 依赖 T02 的 bootstrap/模型契约与 T03 的 Command 契约；T05 依赖可运行产物。服务端 `T-server`（#A）独立推进，GUI 侧以 Mock 先打通、env 后驱动。
+
+---
+
+# 增量变更设计：Ollama → llama.cpp（`llama-server`）
+
+> 作者：架构师 高见远（software-architect）
+> 触发：用户已拍板走路径 **A**——把本地推理后端从 ollama 换成 **llama.cpp 的 `llama-server`**（sidecar 直连 GGUF），彻底消除 Intel x86_64 / macOS 13 上的 `ollama minos=14.0` 死结。
+> 依据：对 `ide-m1` 全仓（Rust core/gui + CI + 打包脚本）的实地核查结论（见各节「代码核查结论」）。
+> 形态不变：仍是单一 .dmg 自包含（GUI + llama-server + qwen2.5-0.5b.gguf + PostgreSQL + aidea serve），零配置本地对话 + 在线厂商切换。
+
+---
+
+## A. 系统设计方案（增量）
+
+### A.1 实现方案 + 框架选型
+
+#### A.1.1 核心思路（最小变更、结构化解死结）
+
+- **不再依赖 ollama 封装层**。ollama 的 `/api/chat`、`/api/generate`、`/api/embeddings` 全部替换为 `llama-server` 的 **OpenAI 兼容端点**（`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/health`）。
+- **关键复用发现（代码核查）**：`ide-core` 里**早已存在** OpenAI 兼容实现——`crates/core/src/llm.rs` 的 `OpenAiLlm`（调 `/v1/chat/completions`）与 `crates/probe/src/openai.rs` 的 `OpenAiCompletionBackend`（同样调 `/v1/chat/completions`）。它们正是「在线厂商」用的后端。→ **本地 llama-server 路径直接复用这两个实现，仅把 base_url 指向 `http://127.0.0.1:<port>/v1`、api_key 留空**。这意味着：
+  - 既有的 `OllamaLlm` / `OllamaClient` / `NesClient(OllamaClient)` 在「本地」路径上**不再被使用**（可保留代码但停用，或后续清理）；
+  - **本变更对 aidea 对接层的真实改动量大幅低于直觉预期**（详见 A.6 / 关键问题③）。
+- **权重直接加载**：`llama-server --model <gguf路径>` 直接读 GGUF，无需 `ollama create` / Modelfile / 联网拉取。随包内置的 `qwen2.5-0.5b.gguf` 现为「原生格式」，零重烘焙。
+
+#### A.1.2 llama.cpp 版本策略（pin 固定 tag，自编译）
+
+| 项 | 决策 | 理由 |
+|----|------|------|
+| 来源 | **上游官方 `ggml-org/llama.cpp`**，pin 一个 `bXXXX` release tag | 可复现、可审计；不跟 `master`（滚动、API 易漂） |
+| 推荐 tag | **`b6782`**（2025-10，或更晚的稳定 tag；**实现 T1 时锁定具体值**，并写入 `build-dmg.yml` 常量） | 搜索可见官方 tag 已到 `b6782+`；任意近期 `bXXXX` 的 OpenAI 兼容 server 契约稳定 |
+| 产物获取 | **osxcross + CMake 自编译**（与 aidea/aidea-gui 同源工具链），**不下载上游预编译 macos-x64 包** | 上游预编译包的 minos 不可控（正是 ollama 的坑）；自编译把 `MACOSX_DEPLOYMENT_TARGET=10.15` 写死，从根上消除死结 |
+| 编译目标 | `x86_64-apple-darwin`（`-arch x86_64`），单二进制 `llama-server` | 用户机 Intel x86_64 硬约束；llama.cpp 默认把 ggml/llama 静态链进可执行文件，产出**单一自包含二进制**（无 `libggml*.dylib` 外置依赖） |
+| BLAS | `GGML_BLAS=ON` + `GGML_BLAS_VENDOR=Apple`（Accelerate/vecLib） | Accelerate 自 macOS 10.3 起内置，**10.15 完全可用**，Intel CPU 推理显著加速；不引入额外 dylib |
+| Metal | `GGML_METAL=OFF` | Metal 需 macOS 11+，且是 Apple Silicon 路径；Intel 机用不到，关掉避免引入 11+ 依赖 |
+| OpenMP | 保持默认（llama.cpp 用自己的线程池，`GGML_OPENMP` 默认 off） | 避免链接 `libomp` 带来的 minos/依赖复杂度 |
+| 仅编 server | `-DLLAMA_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF` | 只产 `llama-server`，省 CI 时长与体积 |
+
+> 推荐 CMake 调用（env 由 osxcross 环境提供 `x86_64-apple-darwinXX-clang` / SDK）：
+> ```bash
+> export MACOSX_DEPLOYMENT_TARGET=10.15
+> cmake -S . -B build \
+>   -DCMAKE_SYSTEM_NAME=Darwin \
+>   -DCMAKE_OSX_SYSROOT="$OSXCROSS_SDK" \
+>   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+>   -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+>   -DGGML_METAL=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple \
+>   -DLLAMA_SERVER=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF
+> cmake --build build --target llama-server -j"$(nproc)"
+> # 产物：build/bin/llama-server  →  拷贝为 .bundle/bin/llama-server-${TARGET_TRIPLE}
+> ```
+
+#### A.1.3 架构模式（不变部分沿用）
+
+前端 React/Vite + Tauri v2 + gRPC(tonic) 直调本地 `aidea serve`；bootstrap 用 `std::process::Command` 拉起并监管 sidecar 的生命周期（PG / llama-server / serve）。**PostgreSQL sidecar、Tauri GUI、在线厂商切换能力全部原样保留。**
+
+### A.2 文件列表（相对路径；改动 / 新增 / 删除）
+
+| 文件 | 动作 | 改动要点 |
+|------|------|----------|
+| `.github/workflows/build-dmg.yml` | **改** | 删除「Download ollama macOS binary」整段（含 `OLLAMA_VERSION`/`patch-macos-minos.py` 调用/`lib/ollama` 拷贝/runner 三态探测）；**新增「Build llama.cpp (llama-server) via osxcross+CMake」step**（pin tag、env、拷贝单二进制）。更新 `verify` step 的 sidecar 列表与 minos 基线。 |
+| `scripts/ci/patch-macos-minos.py` | **删** | 不再需要——llama.cpp 直接编成 10.15，无 minos 补丁步骤。 |
+| `gui/scripts/fetch-binaries.sh` | **改** | `ollama` 拷贝段改为 `llama-server`（从 `LLAMA_SERVER_BIN` 指定路径拷贝，dev 期预编译产物）。 |
+| `package-dmg.sh` | **改** | `SIDECARS=(... ollama ...)` → `... llama-server ...`；删除 `lib/ollama` runner 拷贝/`chmod` 逻辑（llama-server 单二进制无 lib 依赖）；`Resources/lib/` 注释去掉 ollama。 |
+| `scripts/ci/verify-macho.sh` | **改** | `BUNDLE_MIN_MACOS` 由 `11.0` → `10.15`；sidecar 断言列表 `ollama` → `llama-server`；其余通用解析逻辑（`sidecar_check`/`payload_check`）基本复用。 |
+| `scripts/ci/verify-payload.sh` | **改** | `ollama_check`（含 runner 三态 BUNDLED/ABSENT/EMBEDDED）整体替换为 `llama_server_check`：**单二进制存在性 + 体积下限（≈8 MiB）+ minos 观测**，删掉 runner 三态与对应单测形态。 |
+| `gui/src-tauri/tauri.conf.json` | **改** | `externalBin`：`"bin/ollama"` → `"bin/llama-server"`；`macOS.minimumSystemVersion`：`"11.0"` → `"10.15"`。 |
+| `gui/src-tauri/resources/models/nes-tab/Modelfile` | **删** | ollama 专属；llama-server 直接读 GGUF，不再需要。 |
+| `scripts/nes-tab.Modelfile` | **删/确认** | 旧 `FROM qwen2.5:0.5b`（hub 引用）已无用，建议删除（先 grep 确认无引用）。 |
+| `gui/src-tauri/src/bootstrap/ollama.rs` | **改名→`llamacpp.rs`** | 启动 `llama-server --model <gguf> --host 127.0.0.1 --port <LLAMACPP_PORT>`；轮询端口就绪；**删除 `ollama create nes-tab`**。 |
+| `gui/src-tauri/src/bootstrap/mod.rs` | **改** | `pub mod ollama;` → `pub mod llamacpp;`；`bootstrap_stack` 里 `ollama::start` → `llamacpp::start`；注释里的「Ollama」措辞更新。 |
+| `gui/src-tauri/src/state.rs` | **改** | `BootstrapHandles.ollama: Child` → `llamacpp: Child`（仅字段重命名）。 |
+| `gui/src-tauri/src/model_backend.rs` | **改** | `VendorKind::Local` 注入改为：`AIDEA_LLM_BACKEND=local`、`AIDEA_NES_BACKEND=local`、`AIDEA_LLM_BASE_URL=http://127.0.0.1:<LLAMACPP_PORT>/v1`、`AIDEA_LLM_MODEL=<MODEL_ID>`。 |
+| `crates/core/src/config.rs` | **改** | `LlmBackend`/`NesBackend` 枚举增加 `Local` 变体 + `parse`/`from_map` 处理（`"local"`→`Local`）；注释更新。 |
+| `crates/core/src/agent.rs` | **改** | `build_llm` / `default_nes_backend` 增加 `Local` 分支：构造 `OpenAiLlm::new(base_url, "", model)` 与 `NesClient::with_backend(OpenAiCompletionBackend::new(...))`（base_url=localhost，无 key）。 |
+| `crates/probe/src/ollama.rs` | **改（停用本地路径）** | `OllamaClient`/`NesClient` 不再被 `Local` 选用；保留 `MockOllamaClient`/`RuleBasedBackend`/cache/degradation/batch（仍被 Mock 与测试用）。建议加 `#[deprecated]` 标记 `OllamaClient`/`OllamaLlm`。 |
+| `crates/core/src/llm.rs` | **改（小）** | `OllamaLlm` 保留但 `Local` 不再走它；可在文档/`#[deprecated]` 标注。无需新写 chat 逻辑（复用 `OpenAiLlm`）。 |
+| `crates/probe/src/openai.rs` | **复用（保持不变）** | `OpenAiCompletionBackend` 直接作为本地 NES 后端。如需 embeddings，新增 `OpenAiEmbeddingClient`（见待明确）。 |
+| `docs/sequence-diagram.mermaid` `docs/class-diagram.mermaid` | **改** | 已更新（见仓库）。 |
+| `docs/system_design.md` | **改** | 本增量章节。 |
+
+### A.3 数据结构和接口
+
+#### A.3.1 `llama-server` 的 OpenAI 兼容端点契约（本地推理后端）
+
+```
+GET  /health                                  → { "status": "ok" }            # 就绪探测
+POST /v1/chat/completions                     → { choices:[{ message:{role,content}, finish_reason }], usage }
+     body: { model, messages:[{role,content}], stream:false, temperature }
+POST /v1/completions                          → { choices:[{ text, finish_reason }] }   # 非 chat 补全（NES 可选走）
+POST /v1/embeddings                           → { data:[{ embedding:[f32], index }] }   # 向量化（可选）
+GET  /v1/models                               → { data:[{ id:"<model-id>" }] }
+```
+- **端口**：`LLAMACPP_PORT`（**推荐 `8080`**，llama.cpp 默认；与 ollama 的 11434 解耦，避免历史混淆）。base_url = `http://127.0.0.1:8080/v1`。
+- **model 字段**：单模型常驻时，llama-server 接受任意 `model` 值；为稳定建议固定 `MODEL_ID`（如 `nes-tab` 或 `qwen2.5-0.5b`），并在启动时可加 `--alias nes-tab`（若所 pin tag 支持；否则忽略，服务端按单模型匹配）。
+- **启动参数建议**：`llama-server --model "$GGUF" --host 127.0.0.1 --port 8080 --alias nes-tab`（不挂 GPU/Metal；CPU+Accelerate）。GGUF 路径 = `resource_dir()/resources/models/nes-tab/qwen2.5-0.5b.gguf`。
+
+#### A.3.2 aidea → llama-server 调用关系（类图见 `class-diagram.mermaid`）
+
+```
+前端 ──gRPC──> aidea serve ──HTTP /v1/chat/completions──> llama-server(:8080) ──读──> qwen2.5-0.5b.gguf
+                          └─ NES: OpenAiCompletionBackend ──/v1/chat/completions──> llama-server
+```
+- `LlmBackend::Local` ⇒ `OpenAiLlm`（已存在）指向 localhost；
+- `NesBackend::Local` ⇒ `NesClient::with_backend(OpenAiCompletionBackend)`（已存在）指向 localhost；
+- `OllamaLlm` / `OllamaClient` 在 `Local` 路径下**不再被引用**（仅 `Mock`/历史保留）。
+
+### A.4 程序调用流程（时序图见 `sequence-diagram.mermaid`）
+
+6 条主线与旧设计一致，**仅 ①、② 变更**：
+1. **① 启动拉起**：PG → **llama-server（直接加载 GGUF，不再 `ollama create`）** → serve（env 注入 `BASE_URL=http://127.0.0.1:8080/v1`，`BACKEND=local`）。
+2. **② Chat（本地）**：serve → llama-server `POST /v1/chat/completions`（替代旧 `ollama /api/chat`）。
+3. ③ Chat（在线）、④ 模型后端切换（**仅重启 serve，llama-server 常驻不重启**）、⑤ Quest/Comment、⑥ 健康概览 —— 均不变。
+
+### A.5 六关键问题回答（代码核查结论）
+
+1. **llama.cpp 交叉编译可行性**：✅ 顺畅。osxcross+CMake 与既有 aidea 编译同源；build deps 仅 `cmake(≥3.17)` + osxcross clang + git（拉 tag）。产出**单二进制** `llama-server`（ggml/llama 默认静态链入），无外置 `libggml*.dylib`。推荐 env 见 A.1.2。CMake 调用与 env 见 A.1.2 代码块。
+2. **Intel CPU + macOS 10.15（无 Metal）**：✅ 正常 CPU 推理。GGML CPU backend 不依赖 Metal；`GGML_BLAS=ON`+Apple(Accelerate) 在 10.15 可用（vecLib 自 10.3 内置）。无需关额外 feature（仅 `GGML_METAL=OFF`）。**结论：10.15 + Intel + 纯 CPU（Accelerate 加速）完全可行。**
+3. **aidea 对接层改造成本（最大工作量评估）**：**远低于直觉**。代码核查证实 `OpenAiLlm`（`/v1/chat/completions`）与 `OpenAiCompletionBackend`（`/v1/chat/completions`）**已经存在且被「在线厂商」使用**。本地 llama-server 只是把它们指向 localhost。真实改动 = ① 枚举加 `Local` 变体（config.rs，~10 行）；② 工厂两处加 `Local` 分支（agent.rs，~15 行，复用既有 OpenAi 实现）；③ GUI vendor 注入改 env（model_backend.rs，~8 行）；④ bootstrap 从「启 ollama+create」改为「启 llama-server」（ollama.rs→llamacpp.rs，~60 行）。**无需新写任何 HTTP 请求/解析代码**。端点契约差异（ollama `/api/chat` vs llama.cpp `/v1/chat/completions`）= 已通过既有 `OpenAiLlm` 解决，无需适配层。
+4. **sidecar 布局变更**：`bin/ollama-${TRIPLE}` + `lib/ollama/runners` → **`bin/llama-server-${TRIPLE}`（单二进制）**。tauri.conf `externalBin`、`package-dmg.sh` 的 `SIDECARS`、`fetch-binaries.sh`、verify 脚本断言同步改。**`patch-macos-minos.py` 步骤直接删除**（llama.cpp 编成 10.15，无需补丁）。
+5. **模型权重**：✅ 确认。llama-server 直接读 GGUF（`--model`），无需 `ollama run`/`create`，权重零重烘焙。启动参数见 A.3.1。权重路径：`resources/models/nes-tab/qwen2.5-0.5b.gguf`（CI 已烘焙进包，build-dmg.yml 的 GGUF 下载 step 保留）。
+6. **风险点**：
+   - **CI 编译时长/体积**：llama.cpp 全量编译较重（免费 Linux runner + osxcross 约 10–20 min）。缓解：pin tag（tag 不变则不重编）、只编 `llama-server` target、关 examples/tests、CI 缓存 build 目录。
+   - **llama.cpp API 漂移**：pin `bXXXX` tag + CI「minos=10.15 + 端口探活 `/health`」断言兜底。
+   - **对话流式协议差异**：当前 `OpenAiLlm`/`OpenAiCompletionBackend` 都用 `stream:false`；与旧 ollama `stream:false` 一致，**本次零改动**。若未来要 SSE 流式，llama-server 支持 `/v1/chat/completions` 的 `stream:true`（SSE），属后续增强，不在 M1。
+   - **FIM 补全语义**：`OpenAiCompletionBackend` 走 chat（非真 FIM `/v1/completions` 的 `input_prefix/suffix`），与既有「在线 NES」行为一致，M1 可接受；真 FIM 可后续用 llama.cpp 原生 `/completion` 增强。
+   - **embeddings**：`NesClient::embed` 旧走 ollama `/api/embeddings`；本地走 llama-server `/v1/embeddings`（Qwen2.5-Instruct 在 llama.cpp 支持 embedding）。若所 pin tag/构建不支持或效果弱，应**优雅降级**（见待明确）。
+   - **Tauri sidecar 权限**：llama-server 用 `std::process::Command` 启动（与 ollama 同源机制），loopback 监听无需网络权限弹窗；`hardened-runtime:false` + 未签名 sidecar 与 ollama 现状一致，可正常工作。
+   - **minimumSystemVersion 下调到 10.15 的安全性**：用户机是 macOS 13，下调声明更宽松、无害；但需确认 Tauri 2 运行时自身 minos（历史为 10.13+），构建期 verify 会兜底。
+
+### A.6 明确建议（架构师拍板）
+
+1. **认可路径 A**：✅ 完全认可。从 ollama 封装层切换到 `llama-server` sidecar 是正确且结构性的解法，直接消除 minos 死结、复用既有 GGUF、且对接层改动极小。
+2. **llama.cpp 版本**：✅ **pin 一个固定的 `bXXXX` tag（推荐 `b6782` 或实现时锁定更新的稳定 tag）**，用 osxcross+CMake 自编译（`MACOSX_DEPLOYMENT_TARGET=10.15`、`GGML_METAL=OFF`、`GGML_BLAS=ON`+Apple/Accelerate）。**不要**下载上游预编译 macos-x64 包（minos 不可控）。
+3. **aidea 对接层最省事改法**：✅ **不新写任何推理 HTTP 代码**——`Local` 后端直接复用既有 `OpenAiLlm` 与 `OpenAiCompletionBackend`，仅把 `base_url` 指向 `http://127.0.0.1:8080/v1`、api_key 留空。枚举加 `Local` 变体 + 工厂两处分支 + GUI vendor 注入 + bootstrap 改写，即完成。这是本变更工作量最低、风险最小的路径。
+4. **端口约定**：✅ `LLAMACPP_PORT=8080`（llama.cpp 默认，与 11434 解耦）。
+5. **minos 基线**：✅ 全栈统一 **10.15**（aidea / llama-server 均 osxcross 编 10.15；tauri.conf `minimumSystemVersion=10.15`；verify 脚本 `BUNDLE_MIN_MACOS=10.15`）。
+
+---
+
+## B. 任务分解（实现顺序；标注依赖与改动文件）
+
+> 约束对齐 SOP：≤5 主任务 / 首任务为基础设施类 / 每组≥3 文件。文档产出（本增量章节 + 两张 mermaid）为架构师交付物，不单列任务；但作为 T1–T5 的验收参考。
+
+- **T1 · CI：用 osxcross+CMake 交叉编译 `llama-server` 替换 ollama 下载**（依赖：无）
+  - 文件：`.github/workflows/build-dmg.yml`（删 ollama 下载/patch/runner 探测整段；新增 llama.cpp 编译 step：pin tag、env、`-DLLAMA_SERVER=ON`、拷贝 `bin/llama-server-${TARGET_TRIPLE}`、更新 verify 的 sidecar 列表与 minos 基线）、`gui/scripts/fetch-binaries.sh`（ollama→llama-server）、**删除** `scripts/ci/patch-macos-minos.py`。
+  - 交付：CI 产出 x86_64、minos=10.15 的单二进制 `llama-server`，verify 通过。
+
+- **T2 · 打包与校验脚本适配**（依赖：T1——约定 sidecar 名 `llama-server`）
+  - 文件：`package-dmg.sh`（`SIDECARS` 的 `ollama`→`llama-server`；删 `lib/ollama` runner 拷贝/`chmod` 逻辑）、`scripts/ci/verify-macho.sh`（`BUNDLE_MIN_MACOS` 11.0→10.15；sidecar 列表 ollama→llama-server）、`scripts/ci/verify-payload.sh`（`ollama_check`+runner 三态 → `llama_server_check` 单二进制断言 + 删对应单测形态）。
+  - 交付：.app 内 `Contents/Resources/bin/llama-server` 就位、macho 断言 minos=10.15、payload 断言通过。
+
+- **T3 · Tauri 声明与端侧资源**（依赖：无）
+  - 文件：`gui/src-tauri/tauri.conf.json`（`externalBin` `bin/ollama`→`bin/llama-server`；`minimumSystemVersion` 11.0→10.15）、**删除** `gui/src-tauri/resources/models/nes-tab/Modelfile` 与（确认无引用后）`scripts/nes-tab.Modelfile`。
+  - 交付：Tauri 打包声明与 10.15 基线对齐，无 ollama 残留资源。
+
+- **T4 · aidea 推理对接层（core crate）**（依赖：无——仅定义枚举/工厂与 env 约定，供 T5 引用）
+  - 文件：`crates/core/src/config.rs`（`LlmBackend`/`NesBackend` 加 `Local` + parse/from_map）、`crates/core/src/agent.rs`（`build_llm`/`default_nes_backend` 加 `Local` 分支，复用 `OpenAiLlm`/`OpenAiCompletionBackend` + `NesClient::with_backend`）、`crates/core/src/llm.rs`（标注 `OllamaLlm` deprecated，Local 不走）、`crates/probe/src/ollama.rs`（标注 `OllamaClient` deprecated，Local 不走）、`crates/probe/src/openai.rs`（复用，可选补 `OpenAiEmbeddingClient`）。
+  - 交付：env `AIDEA_LLM_BACKEND=local` / `AIDEA_NES_BACKEND=local` + `AIDEA_LLM_BASE_URL=http://127.0.0.1:8080/v1` 可被正确解析并路由到 llama-server。
+
+- **T5 · GUI sidecar 编排 + vendor 注入**（依赖：T3 的 externalBin 名、T4 的 env/枚举约定）
+  - 文件：`gui/src-tauri/src/bootstrap/ollama.rs`→**改名 `llamacpp.rs`**（启 `llama-server --model <gguf> --host 127.0.0.1 --port 8080`、轮询端口、删 `ollama create`）、`gui/src-tauri/src/bootstrap/mod.rs`（`pub mod ollama`→`llamacpp`；`ollama::start`→`llamacpp::start`）、`gui/src-tauri/src/state.rs`（`BootstrapHandles.ollama`→`llamacpp`）、`gui/src-tauri/src/model_backend.rs`（`VendorKind::Local` 注入 local + base_url + model env）。
+  - 交付：一键拉起 PG→llama-server→serve，本地 chat/补全走 llama-server，在线切换仅重启 serve。
+
+> 依赖图：T1 独立；T2 依赖 T1 的命名约定；T3 独立；T4 独立（产出约定）；T5 依赖 T3+T4。T1/T3/T4 可并行；T2 在 T1 后；T5 最后。
+
+### B.1 依赖包 / 构建项列表
+
+- **llama.cpp build deps（CI 新增）**：`cmake ≥ 3.17`（建议 3.27+）、osxcross 工具链（`x86_64-apple-darwinXX-clang` + SDK，已用于 aidea）、`git`（拉 tag）、`make`/`ninja`。**无新第三方 Rust 依赖**（aidea 侧仅改枚举/工厂，不引 crate）。
+- **CI steps 新增项**：`Checkout llama.cpp @ <pinned bXXXX tag>` → `CMake configure`（见 A.1.2 env）→ `CMake build --target llama-server` → `拷贝 build/bin/llama-server → .bundle/bin/llama-server-${TARGET_TRIPLE}`。`scripts/ci/patch-macos-minos.py` 调用**移除**。
+
+### B.2 共享知识（跨文件约定）
+
+- **sidecar 命名规则**：所有 bundled 二进制落 `Contents/Resources/bin/<name>`，Tauri `externalBin` 追加 triple 后缀；本变更后端侧推理 sidecar = **`llama-server`**（单二进制，无 `lib/` 子目录）。
+- **minos 基线（全栈统一）**：**10.15**。aidea 与 llama-server 均由 osxcross 以 `MACOSX_DEPLOYMENT_TARGET=10.15` 编译；tauri.conf `minimumSystemVersion=10.15`；verify 脚本 `BUNDLE_MIN_MACOS=10.15`。→ 不再有「minos 补丁」环节。
+- **vendor → serve env 约定（Local 模式，GUI 注入）**：
+  - `AIDEA_GRPC_ADDR=127.0.0.1:50051`
+  - `AIDEA_DATABASE_URL=postgres://aidea:aidea@127.0.0.1:5432/aidea`
+  - local：`AIDEA_LLM_BACKEND=local` `AIDEA_NES_BACKEND=local` `AIDEA_LLM_BASE_URL=http://127.0.0.1:8080/v1` `AIDEA_LLM_MODEL=<MODEL_ID>`（如 `nes-tab`）
+  - online（不变）：`AIDEA_LLM_BACKEND=openai` `AIDEA_NES_BACKEND=openai` `AIDEA_LLM_BASE_URL=<自定义>` `AIDEA_LLM_MODEL=<如 deepseek-chat>` `AIDEA_LLM_API_KEY=<keyring>`
+- **llama-server 启动约定**：`llama-server --model <gguf> --host 127.0.0.1 --port 8080 [--alias nes-tab]`；GGUF 路径 = `resource_dir()/resources/models/nes-tab/qwen2.5-0.5b.gguf`；常驻（不随 local/online 切换重启）。
+- **端口**：llama-server = `8080`；aidea serve gRPC = `50051`；admin = `9090`（不变）。
+- **退路（tolerate）**：llama-server 启动失败 → bootstrap 容忍（与旧 ollama 一致），serve 仍可起，本地 chat 降级为不可用/走在线；NES 仍走 `RuleBasedBackend` 兜底。
+
+### B.3 待明确事项
+
+- **#L1 embeddings 本地路径**：`NesClient::embed` 旧依赖 ollama `/api/embeddings`。本地走 llama-server `/v1/embeddings`（需 Qwen2.5-Instruct 在 llama.cpp 开启 embedding 支持）。若所 pin tag 不支持或效果弱，建议：(a) 新增 `OpenAiEmbeddingClient` 复用 `/v1/embeddings` 契约；或 (b) `embed` 在本地优雅降级（返回空/走规则），不影响 chat/补全主路径。请确认 NES 的 `embed` 在 M1 是否为关键路径（疑似仅用于向量化/检索，非核心对话）。
+- **#L2 `--alias` 支持**：部分 llama.cpp tag 的 `llama-server` 未提供 `--alias`；若缺失，`model` 字段用任意固定 id（单模型常驻时服务端按单模型匹配，忽略 id）。建议以所 pin tag 实测为准，CI 用 `/v1/models` 或 `/health` 探活即可。
+- **#L3 `scripts/nes-tab.Modelfile` 引用**：确认仓库内无其他脚本引用该根 Modelfile（grep 结果仅 build-dmg.yml 引用 `resources/models/nes-tab/` 下的 GGUF 与 Modelfile 目录），删除前做一次全仓 grep 确认。
+- **#L4 Tauri 运行时 minos**：下调 `minimumSystemVersion` 到 10.15 前，构建期 verify 已兜底；另需确认 Tauri 2 自身运行时最低 macOS（历史 10.13+），确保 10.15 声明不矛盾。
+- **#L5 模型 id 与 `model_name` 默认值**：`CoreConfig.model_name` 默认仍为 `nes-tab:latest`（ollama 语义残留），Local 模式下建议改为 `<MODEL_ID>`（如 `nes-tab`）仅作为请求 `model` 字段，不再代表 ollama tag；属命名整洁项，不影响功能。
