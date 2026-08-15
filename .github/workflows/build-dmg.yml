@@ -290,6 +290,12 @@ jobs:
             echo "OSXCROSS_SDK=$SDK_DIR"
             echo "OSXCROSS_PREFIX=$PREFIX"
             echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+            # 交叉编译器路径本身也必须跨 step 传递：GitHub Actions 里 step 之间只有
+            # $GITHUB_ENV / $GITHUB_PATH 能传变量，局部 shell 变量在本 step 结束即丢。
+            # 缺这两行会让后续 "Build llama.cpp" step 的
+            # -DCMAKE_C_COMPILER="$CLANG" 收到空串 → configure_rc=1（run #25 死因）。
+            echo "CLANG=$CLANG"
+            echo "CLANGXX=$CLANGXX"
             # cc / cmake crates 走 target 专属变量，避免污染宿主编译
             echo "CC_x86_64_apple_darwin=$CLANG"
             echo "CXX_x86_64_apple_darwin=$CLANGXX"
@@ -554,10 +560,18 @@ jobs:
           set -e
           if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
             echo "::error::llama.cpp build failed (configure_rc=${rc1} build_rc=${rc2})"
-            echo "----- cmake configure tail (last 50 lines) -----"
-            tail -n 50 /tmp/llama-cfg.log
-            echo "----- cmake build tail (last 50 lines) -----"
-            tail -n 50 /tmp/llama-build.log
+            # 关键错误行必须带 ::error:: 前缀 emit —— GitHub 只把该前缀的行收进
+            # annotations API。原先用普通 echo + tail 输出，注解里只剩一句 rc 摘要，
+            # 真实 CMake 报错文本拿不到，导致 run #23 / #25 连续黑盒。
+            # 每段用 { ...; } || true 包住：grep 无命中返回 1、head 提前关管道让
+            # grep 收 SIGPIPE，在 set -e + pipefail 下都会让脚本在此提前中断，
+            # 那样第二段 build 错误就永远打不出来。
+            echo "::error::--- cmake configure key errors ---"
+            { grep -iE 'CMake Error|error:|fatal error|Could NOT find|not found|-- Configuring incomplete' /tmp/llama-cfg.log 2>/dev/null \
+              | head -25 | while IFS= read -r l; do echo "::error::cfg: $l"; done; } || true
+            echo "::error::--- cmake build key errors ---"
+            { grep -iE 'error:|fatal error|undefined reference|ld: ' /tmp/llama-build.log 2>/dev/null \
+              | head -25 | while IFS= read -r l; do echo "::error::build: $l"; done; } || true
             exit 1
           fi
 
