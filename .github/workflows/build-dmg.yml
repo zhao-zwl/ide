@@ -640,7 +640,13 @@ jobs:
           set -euo pipefail
           DST="gui/src-tauri/resources/models/nes-tab/qwen2.5-0.5b.gguf"
           mkdir -p "$(dirname "$DST")"
-          if [ -f "$DST" ]; then echo "已存在，跳过"; exit 0; fi
+          if [ -f "$DST" ]; then
+            echo "已存在，跳过下载"
+            # 兼容：确保 aidea 期望的内置权重别名 nes-tab.gguf 存在
+            NES_DST="$(dirname "$DST")/nes-tab.gguf"
+            if [ ! -f "$NES_DST" ]; then cp "$DST" "$NES_DST"; fi
+            exit 0
+          fi
 
           # Modelfile 里写的是 `FROM ./qwen2.5-0.5b.gguf`，必须与 Modelfile 同目录同名
           URLS="
@@ -660,6 +666,15 @@ jobs:
             fi
             rm -f "$DST.part"
           done
+          # 对齐 aidea 侧 BUNDLED_MODEL_RESOURCE（models/nes-tab/nes-tab.gguf，见
+          # gui/src-tauri/src/bootstrap/llamacpp.rs）：把已下载的 qwen2.5-0.5b.gguf
+          # 复制一份为 nes-tab.gguf，作为内置权重别名。保留原文件名以兼容 verify-payload.sh
+          # 与 MANIFEST 的引用，无需改动其余 CI 步骤；aidea 端据此命中内置 GGUF。
+          NES_DST="$(dirname "$DST")/nes-tab.gguf"
+          if [ "$ok" = 1 ] && [ -f "$DST" ] && [ ! -f "$NES_DST" ]; then
+            cp "$DST" "$NES_DST"
+            echo "端模型别名已生成：$(du -h "$NES_DST" | cut -f1) -> $NES_DST"
+          fi
           if [ "$ok" = 1 ]; then
             echo "端模型权重已烘焙：$(du -h "$DST" | cut -f1)"
           else
