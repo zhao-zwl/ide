@@ -522,24 +522,46 @@ jobs:
           git clone --depth 1 --branch "${LLAMACPP_TAG}" https://github.com/ggml-org/llama.cpp "$WORK/llama.cpp"
           echo "::endgroup::"
           cd "$WORK/llama.cpp"
+
           # 决策 B：用 osxcross 交叉编译 llama-server（OpenAI 兼容本地推理后端），替代 ollama。
-          # CMAKE_TOOLCHAIN_FILE 由 crazymax/osxcross 镜像提供，已把编译器 / sysroot /
-          # deployment target 全部指向 x86_64-apple-darwin + 10.15。
-          # 选项名以实测 tag b1056 的 CMakeLists 为准（非设计文档里的旧名）：
-          #   LLAMA_BUILD_SERVER=ON —— 构建 server 示例（产出 llama-server 二进制）
-          #   LLAMA_METAL=OFF        —— Intel 目标机无 Metal
-          #   LLAMA_ACCELERATE=ON    —— 10.15 Intel 走 Accelerate（设计文档的
-          #                          GGML_BLAS_VENDOR=Apple 并非有效值，改用此开关）
+          # 健壮性修复（run #23 黑盒失败复盘）：
+          #   1) 不再依赖 osxcross 镜像隐式 CMAKE_TOOLCHAIN_FILE（路径缺失即 fatal，且黑盒），
+          #      改为显式指定编译器 / sysroot / 架构 / deployment target。这些变量由 CI
+          #      在 line 281-292 写入 $GITHUB_ENV：CLANG=o64-clang、CLANGXX=o64-clang++、
+          #      SDKROOT=MacOSX SDK 路径。
+          #   2) BLAS / Accelerate / Metal 全关，纯 CPU 编译。交叉编译下 find_package(Accelerate)
+          #      易因 framework search path 错位而失败；纯 CPU 仍走 AVX2，qwen2.5-0.5b 足够快。
+          #   3) 用 set +e + tee 捕获 cmake 输出，失败时把日志尾 emit 成 ::error:: 注解，
+          #      让下次 CI 不再黑盒（见下方 rc1 / rc2 检查与 tail 输出）。
+          set +e
           cmake -S . -B build \
-            -DCMAKE_TOOLCHAIN_FILE="$OSXCROSS_ROOT/toolchain.cmake" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}" \
+            -DCMAKE_SYSTEM_NAME=Darwin \
+            -DCMAKE_C_COMPILER="$CLANG" \
+            -DCMAKE_CXX_COMPILER="$CLANGXX" \
+            -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_METAL=OFF \
-            -DLLAMA_ACCELERATE=ON \
             -DLLAMA_BLAS=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release --target llama-server -j"$(nproc 2>/dev/null || echo 4)"
+            -DLLAMA_ACCELERATE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            2>&1 | tee /tmp/llama-cfg.log
+          rc1=${PIPESTATUS[0]}
+          cmake --build build --config Release --target llama-server -j"$(nproc 2>/dev/null || echo 4)" \
+            2>&1 | tee /tmp/llama-build.log
+          rc2=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
+            echo "::error::llama.cpp build failed (configure_rc=${rc1} build_rc=${rc2})"
+            echo "----- cmake configure tail (last 50 lines) -----"
+            tail -n 50 /tmp/llama-cfg.log
+            echo "----- cmake build tail (last 50 lines) -----"
+            tail -n 50 /tmp/llama-build.log
+            exit 1
+          fi
+
+          # 原 BIN 检查 + 拷贝逻辑（保留）
           BIN="$(find build -type f -name llama-server | head -1)"
           if [ -z "$BIN" ]; then
             echo "::error::llama-server 二进制未产出，交叉编译失败"
