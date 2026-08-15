@@ -540,8 +540,14 @@ jobs:
           #   3) 用 set +e + tee 捕获 cmake 输出，失败时把日志尾 emit 成 ::error:: 注解，
           #      让下次 CI 不再黑盒（见下方 rc1 / rc2 检查与 tail 输出）。
           set +e
+          # 关键：交叉编译（CMAKE_SYSTEM_NAME=Darwin 但宿主是 Linux）时 CMake 不会自动
+          # 推导 CMAKE_SYSTEM_PROCESSOR，它保持空串 → llama.cpp CMakeLists.txt:424 的
+          # if(${CMAKE_SYSTEM_PROCESSOR} MATCHES ...) 展开成 "if ( MATCHES ...)" 语法错误，
+          # configure_rc=1（run #25/#26 死因，T8 修 CLANG 后仍复现）。必须显式指定 x86_64，
+          # 同时让架构分支正确落到 x86/AVX2（line 442）。
           cmake -S . -B build \
             -DCMAKE_SYSTEM_NAME=Darwin \
+            -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
             -DCMAKE_C_COMPILER="$CLANG" \
             -DCMAKE_CXX_COMPILER="$CLANGXX" \
             -DCMAKE_OSX_SYSROOT="$SDKROOT" \
@@ -567,7 +573,7 @@ jobs:
             # grep 收 SIGPIPE，在 set -e + pipefail 下都会让脚本在此提前中断，
             # 那样第二段 build 错误就永远打不出来。
             echo "::error::--- cmake configure key errors ---"
-            { grep -iE 'CMake Error|error:|fatal error|Could NOT find|not found|-- Configuring incomplete' /tmp/llama-cfg.log 2>/dev/null \
+            { grep -iE 'CMake Error|error:|fatal error|Could NOT find|not found|-- Configuring incomplete|given arguments|Unknown arguments|is invalid' /tmp/llama-cfg.log 2>/dev/null \
               | head -25 | while IFS= read -r l; do echo "::error::cfg: $l"; done; } || true
             echo "::error::--- cmake build key errors ---"
             { grep -iE 'error:|fatal error|undefined reference|ld: ' /tmp/llama-build.log 2>/dev/null \
