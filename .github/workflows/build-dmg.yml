@@ -584,7 +584,7 @@ jobs:
             { grep -iE 'CMake Error|error:|fatal error|Could NOT find|not found|-- Configuring incomplete|given arguments|Unknown arguments|is invalid' /tmp/llama-cfg.log 2>/dev/null \
               | head -25 | while IFS= read -r l; do echo "::error::cfg: $l"; done; } || true
             echo "::error::--- cmake build key errors ---"
-            { grep -iE 'error:|fatal error|undefined reference|ld: ' /tmp/llama-build.log 2>/dev/null \
+            { grep -iE 'error:|fatal error|undefined reference|ld: |No rule to make target|Unknown target|ninja: error|make: \*\*\*|No such file or directory' /tmp/llama-build.log 2>/dev/null \
               | head -25 | while IFS= read -r l; do echo "::error::build: $l"; done; } || true
             exit 1
           fi
