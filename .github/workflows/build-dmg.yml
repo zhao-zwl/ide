@@ -529,7 +529,8 @@ jobs:
           mkdir -p .bundle/bin
           WORK="$(mktemp -d)"
           echo "::group::clone llama.cpp @ ${LLAMACPP_TAG}"
-          git clone --depth 1 --branch "${LLAMACPP_TAG}" https://github.com/ggml-org/llama.cpp "$WORK/llama.cpp"
+          git clone --depth 1 --branch "${LLAMACPP_TAG}" https://github.com/ggml-org/llama.cpp "$WORK/llama.cpp" \
+            || { echo "::error::git clone llama.cpp@${LLAMACPP_TAG} failed (network or tag missing)"; exit 1; }
           echo "::endgroup::"
           cd "$WORK/llama.cpp"
 
@@ -574,18 +575,20 @@ jobs:
           set -e
           if [ "$rc1" -ne 0 ] || [ "$rc2" -ne 0 ]; then
             echo "::error::llama.cpp build failed (configure_rc=${rc1} build_rc=${rc2})"
-            # 关键错误行必须带 ::error:: 前缀 emit —— GitHub 只把该前缀的行收进
-            # annotations API。原先用普通 echo + tail 输出，注解里只剩一句 rc 摘要，
-            # 真实 CMake 报错文本拿不到，导致 run #23 / #25 连续黑盒。
-            # 每段用 { ...; } || true 包住：grep 无命中返回 1、head 提前关管道让
-            # grep 收 SIGPIPE，在 set -e + pipefail 下都会让脚本在此提前中断，
-            # 那样第二段 build 错误就永远打不出来。
-            echo "::error::--- cmake configure key errors ---"
-            { grep -iE 'CMake Error|error:|fatal error|Could NOT find|not found|-- Configuring incomplete|given arguments|Unknown arguments|is invalid' /tmp/llama-cfg.log 2>/dev/null \
-              | head -25 | while IFS= read -r l; do echo "::error::cfg: $l"; done; } || true
-            echo "::error::--- cmake build key errors ---"
-            { grep -iE 'error:|fatal error|undefined reference|ld: |No rule to make target|Unknown target|ninja: error|make: \*\*\*|No such file or directory' /tmp/llama-build.log 2>/dev/null \
-              | head -25 | while IFS= read -r l; do echo "::error::build: $l"; done; } || true
+            # T12 自诊断（取代 T11 的脆弱关键词 grep）：不再依赖 grep 漏匹配，
+            # 直接 tail-dump 两份日志的完整尾部，逐行加 ::error:: 前缀 emit。
+            # 编译/链接失败的根因几乎总在日志尾部（最后一个错误即致命错误），
+            # 因此 build 日志优先、行数更多；configure 日志次之。
+            # 绕开 GitHub ~50 条注解上限的策略：优先保证尾部可见（root cause 必在
+            # 尾部），即便超量部分在 annotations API 被截断，原始 job 日志仍完整保留
+            # 这些 ::error:: 行，Watcher 可直接读原始日志拿到 verbatim 错误文本。
+            # 每段用 { ...; } || true 包裹，避免空日志/tail 在 set -e 下提前中断。
+            echo "::error::=== llama.cpp BUILD log (tail 60, rc=${rc2}) ==="
+            { tail -n 60 /tmp/llama-build.log 2>/dev/null | while IFS= read -r l; do
+                echo "::error::build: $l"; done; } || true
+            echo "::error::=== llama.cpp CONFIGURE log (tail 40, rc=${rc1}) ==="
+            { tail -n 40 /tmp/llama-cfg.log 2>/dev/null | while IFS= read -r l; do
+                echo "::error::cfg: $l"; done; } || true
             exit 1
           fi
 
