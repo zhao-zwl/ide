@@ -519,7 +519,11 @@ jobs:
       # -------------------------------------------------------------------
       - name: Build llama.cpp llama-server (cross-compile via osxcross)
         env:
-          LLAMACPP_TAG: b1056
+          # run #26/#27 复盘：b1056(2023-08) 的 server target 名为 'server'（非 llama-server），
+          # 且无 /v1/chat/completions、非 GGUF —— 与 llamacpp.rs 的 OpenAI 契约 + nes-tab.gguf 不兼容。
+          # b4585(2025-01) 同时具备 llama-server target + OpenAI 兼容端点 + GGUF，与工作流的
+          # --target llama-server / find -name llama-server 天然对齐。
+          LLAMACPP_TAG: b4585
         run: |
           set -euo pipefail
           mkdir -p .bundle/bin
@@ -554,9 +558,13 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DLLAMA_BUILD_SERVER=ON \
-            -DLLAMA_METAL=OFF \
-            -DLLAMA_BLAS=OFF \
-            -DLLAMA_ACCELERATE=OFF \
+            -DLLAMA_CURL=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_ACCELERATE=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             2>&1 | tee /tmp/llama-cfg.log
           rc1=${PIPESTATUS[0]}
