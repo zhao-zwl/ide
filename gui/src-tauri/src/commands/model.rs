@@ -5,29 +5,20 @@ use crate::error::GuiResult;
 use crate::grpc::client;
 use crate::ipc::VendorKind;
 use crate::state::AppState;
-use std::process::Command;
 use tauri::{AppHandle, Manager};
 
-/// 列出本地 Ollama 已拉取的模型名（`ollama list`，离线/缺失二进制时返回空）。
+/// 列出本地可用模型（llama.cpp 单模型形态：返回当前配置的本地 GGUF 模型标识）。
+///
+/// 不再依赖外部 CLI（`ollama list`）：本地为单权重形态，模型即 `VendorConfig`
+/// 中的 `local_model`；缺失时返回空列表（前端据此隐藏本地模型切换）。
 #[tauri::command]
 pub async fn model_list_local(app: AppHandle) -> GuiResult<Vec<String>> {
-    use crate::bootstrap::sidecar::bin_path;
-    let bin = bin_path(&app, "ollama");
-    if !bin.exists() {
-        return Ok(vec![]);
-    }
-    match Command::new(&bin).args(["list"]).output() {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let names: Vec<String> = s
-                .lines()
-                .skip(1) // 跳过表头
-                .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
-                .filter(|n| !n.is_empty())
-                .collect();
-            Ok(names)
-        }
-        _ => Ok(vec![]),
+    let state = app.state::<AppState>();
+    let model = state.vendor.lock().unwrap().local_model.clone();
+    if model.is_empty() {
+        Ok(vec![])
+    } else {
+        Ok(vec![model])
     }
 }
 

@@ -6,7 +6,7 @@
 #
 # 依赖（在打包机上需已就绪）：
 #   * aidea        —— `cargo build --release` 产物（crates/cli 的 `aidea` 二进制）
-#   * ollama       —— 本地 ollama 可执行文件
+#   * llama-server —— llama.cpp 交叉编译的 llama-server 可执行文件
 #   * postgres 等  —— 来自 PostgreSQL 安装（如 `brew --prefix postgresql@17` 的 bin）
 set -euo pipefail
 
@@ -28,13 +28,13 @@ else
   echo "WARN: aidea 二进制缺失（$AIDEA_BIN），请先 cargo build --release" >&2
 fi
 
-# --- ollama（系统 PATH 或指定 OLLAMA_BIN）----------------------------------
-OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama || true)}"
-if [ -n "$OLLAMA_BIN" ]; then
-  cp "$OLLAMA_BIN" "$BIN_DIR/ollama-$TRIPLE"
-  echo "copied ollama -> bin/ollama-$TRIPLE"
+# --- llama-server（llama.cpp 交叉编译产物，需先置于 PATH 或指定 LLAMACPP_BIN）---
+LLAMACPP_BIN="${LLAMACPP_BIN:-$(command -v llama-server || true)}"
+if [ -n "$LLAMACPP_BIN" ]; then
+  cp "$LLAMACPP_BIN" "$BIN_DIR/llama-server-$TRIPLE"
+  echo "copied llama-server -> bin/llama-server-$TRIPLE"
 else
-  echo "WARN: ollama 未找到（OLLAMA_BIN），chat 离线将不可用" >&2
+  echo "WARN: llama-server 未找到（LLAMACPP_BIN），chat 离线将不可用" >&2
 fi
 
 # --- PostgreSQL 工具链（initdb / postgres / pg_ctl / psql）-----------------

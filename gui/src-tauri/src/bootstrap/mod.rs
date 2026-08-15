@@ -1,10 +1,10 @@
 //! 后端栈一键拉起编排（sidecar 的生命周期总控）。
 //!
-//! 按序启动：PostgreSQL → Ollama → 端模型 nes-tab → aidea serve，并在 serve
+//! 按序启动：PostgreSQL → llama.cpp llama-server → aidea serve，并在 serve
 //! 就绪后建立 gRPC 连接。每一阶段通过 [`emit_progress`] 向前端广播进度；失败按
-//! 阶段语义决定是否可容忍（Ollama 离线可容忍，PG / serve 不可容忍）。
+//! 阶段语义决定是否可容忍（llama-server 离线/缺权重可容忍，PG / serve 不可容忍）。
 
-pub mod ollama;
+pub mod llamacpp;
 pub mod pg;
 pub mod serve;
 pub mod sidecar;
@@ -41,13 +41,13 @@ pub fn emit_progress(app: &AppHandle, phase: BootstrapPhase, progress: f32, deta
     );
 }
 
-/// 拉起完整后端栈（PG → Ollama → 模型 → serve → 连接）。
+/// 拉起完整后端栈（PG → llama-server → serve → 连接）。
 ///
 /// * PG 失败 → 返回错误（数据库不可用，后续都无意义）。
-/// * Ollama / 模型创建失败 → 容忍（离线或缺少基础权重，serve 仍可启动）。
+/// * llama-server / 缺权重失败 → 容忍（离线或缺少基础权重，serve 仍可启动）。
 /// * serve 失败 → 返回错误（核心服务不可达）。
 pub async fn bootstrap_stack(app: &AppHandle) -> Result<(), GuiError> {
-    // 记录 App 数据目录（PG 数据目录、Ollama 模型库置于其下）。
+    // 记录 App 数据目录（PG 数据目录、llama.cpp 模型库置于其下）。
     {
         let dir = sidecar::app_data_dir(app);
         *app.state::<AppState>().app_data_dir.lock().unwrap() = Some(dir);
@@ -71,14 +71,14 @@ pub async fn bootstrap_stack(app: &AppHandle) -> Result<(), GuiError> {
         return Err(e);
     }
 
-    // ② Ollama + 端模型 nes-tab（离线可容忍）
-    if let Err(e) = ollama::start(app).await {
-        tracing::warn!("ollama / 端模型启动失败（离线或缺少基础权重）: {e}");
+    // ② llama.cpp llama-server（离线/缺权重可容忍）
+    if let Err(e) = llamacpp::start(app).await {
+        tracing::warn!("llama-server / 本地推理启动失败（离线或缺少基础权重）: {e}");
         emit_progress(
             app,
             BootstrapPhase::Ollama,
             0.7,
-            Some("Ollama / 模型不可用（离线），serve 将继续启动"),
+            Some("llama-server / 模型不可用（离线），serve 将继续启动"),
         );
     }
 

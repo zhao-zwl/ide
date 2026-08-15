@@ -294,19 +294,23 @@ impl AgentServer {
     }
 }
 
-/// Build the reasoning LLM for the given config (决策 #A).
+/// Build the reasoning LLM for the given config (决策 #A / B).
 ///
 /// 选择逻辑：
 ///   * `LlmBackend::Ollama` → [`OllamaLlm`]，调用本地 Ollama 的 `nes-tab:latest`
-///     （端点 `model_endpoint`，模型 `model_name`）。
-///   * `LlmBackend::OpenAi` → [`OpenAiLlm`]，调用 OpenAI 兼容 `/v1/chat/completions`
+///     （端点 `model_endpoint`，模型 `model_name`）。保留作历史/兼容路径。
+///   * `LlmBackend::OpenAi` → [`OpenAiLlm`]，调用在线 OpenAI 兼容 `/v1/chat/completions`
 ///     （base `llm_base_url`，key `llm_api_key`，模型 `llm_model`）。
+///   * `LlmBackend::Local` → [`OpenAiLlm`]，复用在线厂商同款实现，但 base 指向本地
+///     `llama-server`（`llm_base_url` 默认 `http://127.0.0.1:8080/v1`，key 留空）。
+///     **这是 M1 默认本地推理后端**（决策 B：用 llama.cpp 替换 Ollama）。
 ///   * 其它（含 `Mock`）→ [`MockLlm`]，离线/CI 确定性行为。
 ///
 /// 该函数在 `from_config`、`aidea chat`、`aidea quest` 间共享，保证服务端 gRPC 与
-/// CLI 走同一套 backend 选择（决策 #A：先让 aidea chat 走真实 Ollama 推理）。
+/// CLI 走同一套 backend 选择（决策 #A/#B）。
 pub fn build_llm(config: &CoreConfig) -> Arc<dyn Llm> {
     match config.llm_backend {
+        #[allow(deprecated)]
         LlmBackend::Ollama => Arc::new(OllamaLlm::new(
             &config.model_endpoint,
             &config.model_name,
@@ -316,25 +320,39 @@ pub fn build_llm(config: &CoreConfig) -> Arc<dyn Llm> {
             &config.llm_api_key,
             &config.llm_model,
         )),
+        LlmBackend::Local => Arc::new(OpenAiLlm::new(
+            &config.llm_base_url,
+            &config.llm_api_key,
+            &config.llm_model,
+        )),
         LlmBackend::Mock => Arc::new(MockLlm::new()),
     }
 }
 
-/// Build the default NES completion backend for the given config (T08/T09 + #A).
+/// Build the default NES completion backend for the given config (T08/T09 + #A / B).
 ///
 /// `ollama` selects the productionized [`NesClient`] (in-memory cache +
-/// rule-based degradation + bounded-concurrency batch inference); `openai`
-/// selects the OpenAI-compatible [`OpenAiCompletionBackend`]; everything else
-/// falls back to the deterministic [`MockOllamaClient`] (offline / CI).
-/// Shared by the gRPC server and the `aidea` CLI so both pick the same backend.
+/// rule-based degradation + bounded-concurrency batch inference); `openai` and
+/// `local` both select the OpenAI-compatible [`OpenAiCompletionBackend`] (the
+/// latter pointed at the bundled `llama-server` at `http://127.0.0.1:8080/v1`);
+/// everything else falls back to the deterministic [`MockOllamaClient`] (offline /
+/// CI). Shared by the gRPC server and the `aidea` CLI so both pick the same
+/// backend.
 pub fn default_nes_backend(config: &CoreConfig) -> Arc<dyn CompletionBackend> {
     match config.nes_backend {
+        #[allow(deprecated)]
         crate::config::NesBackend::Ollama => Arc::new(NesClient::from_config(&OllamaConfig {
             endpoint: config.model_endpoint.clone(),
             model: config.model_name.clone(),
             ..OllamaConfig::default()
         })),
         crate::config::NesBackend::OpenAi => Arc::new(OpenAiCompletionBackend::new(OpenAiConfig {
+            base_url: config.llm_base_url.clone(),
+            api_key: config.llm_api_key.clone(),
+            model: config.llm_model.clone(),
+            ..OpenAiConfig::default()
+        })),
+        crate::config::NesBackend::Local => Arc::new(OpenAiCompletionBackend::new(OpenAiConfig {
             base_url: config.llm_base_url.clone(),
             api_key: config.llm_api_key.clone(),
             model: config.llm_model.clone(),

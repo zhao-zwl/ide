@@ -6,7 +6,7 @@
 #   * 一台 Spotlight / mds 服务正常的健康 macOS（否则 cargo 会在依赖解析阶段
 #     死锁 —— 系统 mds 损坏的典型症状：sudo mdutil -i on / 报 -400，
 #     sudo launchctl load .../com.apple.metadata.mds.plist 报 I/O error）。
-#   * Rust 工具链（cargo/rustc）、Node.js + npm、ollama、PostgreSQL 17 已安装。
+#   * Rust 工具链（cargo/rustc）、Node.js + npm、llama-server（llama.cpp）、PostgreSQL 17 已安装。
 #
 # 用法：
 #   bash build-aidea-dmg.sh
@@ -14,7 +14,7 @@
 # 可选环境变量：
 #   PG_BIN       PostgreSQL bin 目录（含 postgres/initdb/pg_ctl/psql）。
 #                默认自动探测：先 Postgres.app，后 brew postgresql@17。
-#   OLLAMA_BIN   ollama 可执行文件绝对路径（默认 command -v ollama）。
+#   LLAMACPP_BIN llama-server 可执行文件绝对路径（默认 command -v llama-server）。
 #   AIDEA_BIN    aidea release 二进制（默认 <root>/target/release/aidea）。
 #   NOTARIZE=1 + APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID  开启公证（默认关闭）。
 #
@@ -50,7 +50,7 @@ fi
 [ -x "$AIDEA_BIN" ] || fail "aidea 二进制缺失：$AIDEA_BIN"
 
 # ---------------------------------------------------------------------------
-# 2) 拉取 sidecar 二进制（aidea / ollama / postgres / initdb / pg_ctl / psql）
+# 2) 拉取 sidecar 二进制（aidea / llama-server / postgres / initdb / pg_ctl / psql）
 # ---------------------------------------------------------------------------
 log "==> [2/5] 拉取 sidecar 二进制"
 if [ -z "${PG_BIN:-}" ]; then
@@ -65,44 +65,35 @@ fi
 [ -n "${PG_BIN:-}" ] || fail "找不到 PostgreSQL bin 目录，请设置 PG_BIN 环境变量"
 [ -x "$PG_BIN/postgres" ] || fail "PG_BIN 指向的目录缺少 postgres：$PG_BIN"
 
-PG_BIN="$PG_BIN" OLLAMA_BIN="${OLLAMA_BIN:-}" AIDEA_BIN="$AIDEA_BIN" \
+PG_BIN="$PG_BIN" LLAMACPP_BIN="${LLAMACPP_BIN:-}" AIDEA_BIN="$AIDEA_BIN" \
   bash gui/scripts/fetch-binaries.sh
 
 # 校验 6 个 sidecar 都存在且带正确后缀
 BIN_DIR="$ROOT/gui/src-tauri/bin"
-for tool in aidea ollama postgres initdb pg_ctl psql; do
+for tool in aidea llama-server postgres initdb pg_ctl psql; do
   f="$BIN_DIR/$tool-$TRIPLE"
   [ -x "$f" ] || fail "sidecar 缺失或不可执行：$f"
 done
 log "6 个 sidecar 校验通过"
 
 # ---------------------------------------------------------------------------
-# 2.5) 烘焙端模型权重进包（离线可用）：pull qwen2.5:0.5b -> 导出本地 gguf
-#      权重随 .dmg 内置，首次启动无需联网即可 ollama create nes-tab。
-#      若 ollama 不可用或拉取失败，则降级为「首次启动联网拉取」模式（不阻断打包）。
+# 2.5) 准备端模型权重进包（离线可用）
+#      llama-server 直接加载单文件 GGUF，无需 ollama 的 pull/导出。
+#      若本地已提供 GGUF（GGUF_SRC 指定路径，或 resources 内已有 nes-tab.gguf），
+#      则拷贝到 resources/models/nes-tab/nes-tab.gguf；否则告警并继续（运行时
+#      llama-server 因缺少模型而不可用，但不阻断打包）。
 # ---------------------------------------------------------------------------
-log "==> [2.5/5] 烘焙端模型 qwen2.5:0.5b 权重进包（离线可用）"
+log "==> [2.5/5] 准备端模型 GGUF 权重进包（离线可用）"
 MODEL_DIR="$ROOT/gui/src-tauri/resources/models/nes-tab"
-GGUF="$MODEL_DIR/qwen2.5-0.5b.gguf"
+GGUF="$MODEL_DIR/nes-tab.gguf"
 if [ -f "$GGUF" ]; then
   log "权重已存在，跳过：$GGUF ($(du -h "$GGUF" 2>/dev/null | cut -f1))"
+elif [ -n "${GGUF_SRC:-}" ] && [ -f "$GGUF_SRC" ]; then
+  cp "$GGUF_SRC" "$GGUF"
+  log "权重已拷贝进包：$GGUF ($(du -h "$GGUF" 2>/dev/null | cut -f1))"
 else
-  OLLAMA_CMD="${OLLAMA_BIN:-$(command -v ollama || true)}"
-  if [ -z "$OLLAMA_CMD" ]; then
-    log "（跳过模型烘焙：未找到 ollama，包将为首次启动联网拉取模式）"
-  else
-    log "拉取 qwen2.5:0.5b ..."
-    "$OLLAMA_CMD" pull qwen2.5:0.5b > /tmp/ollama_pull.log 2>&1 \
-      || log "（ollama pull 失败，包将为首次启动联网拉取模式）"
-    # 从 ollama 模型仓库抽取单文件 GGUF 权重（qwen2.5:0.5b 为单一 gguf blob）
-    BLOB="$("$OLLAMA_CMD" show qwen2.5:0.5b --modelfile 2>/dev/null | grep -E '^FROM ' | awk '{print $2}')"
-    if [ -n "$BLOB" ] && [ -f "$BLOB" ]; then
-      cp "$BLOB" "$GGUF"
-      log "权重已烘焙进包：$GGUF ($(du -h "$GGUF" 2>/dev/null | cut -f1))"
-    else
-      log "（未找到权重 blob，包将为首次启动联网拉取模式）"
-    fi
-  fi
+  log "（跳过模型烘焙：未提供 GGUF_SRC 且 resources 内无 nes-tab.gguf；"
+  log " 运行时 llama-server 将因缺少模型而不可用，但不阻断打包）"
 fi
 
 # ---------------------------------------------------------------------------
@@ -133,7 +124,7 @@ fi
 cd "$ROOT"
 
 # ---------------------------------------------------------------------------
-# 5) 单元测试（验证新增的 LLM 路由逻辑：ollama / openai / mock）
+# 5) 单元测试（验证新增的 LLM 路由逻辑：local / openai / mock）
 # ---------------------------------------------------------------------------
 log "==> [5/5] 运行单元测试"
 cargo test -p ide-core -p ide-probe 2>&1 | tail -25 || \

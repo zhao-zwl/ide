@@ -26,7 +26,7 @@ pub fn load_vendor_config(app: &AppHandle) -> GuiResult<VendorConfig> {
         .unwrap_or(VendorConfig {
             kind: crate::ipc::VendorKind::Local,
             base_url: None,
-            local_model: "nes-tab:latest".to_string(),
+            local_model: "models/nes-tab/nes-tab.gguf".to_string(),
             model: None,
         });
     Ok(cfg)

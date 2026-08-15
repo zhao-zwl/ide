@@ -50,7 +50,7 @@ pub enum ConnStatus {
 
 // ----------------------------- 模型后端（vendor） --------------------------
 
-/// 模型后端种类：本地 Ollama / 在线 OpenAI 兼容。
+/// 模型后端种类：本地 llama.cpp（llama-server）/ 在线 OpenAI 兼容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VendorKind {
@@ -64,7 +64,7 @@ pub struct VendorConfig {
     pub kind: VendorKind,
     /// 在线厂商 base url（含 /v1）；本地为 None。
     pub base_url: Option<String>,
-    /// 本地模型名（默认 nes-tab:latest）。
+    /// 本地模型 GGUF 路径（默认 models/nes-tab/nes-tab.gguf，相对 Resources）。
     pub local_model: String,
     /// 在线厂商模型名（如 deepseek-chat / qwen-plus）；本地为 None。
     /// 非密钥，可与 base_url 一并持久化。

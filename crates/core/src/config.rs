@@ -20,28 +20,38 @@ pub enum NesBackend {
     #[default]
     Mock,
     /// Real local Ollama client (the productionized `NesClient` with cache +
-    /// degradation + batch inference).
+    /// degradation + batch inference). Kept for backward compatibility; the
+    /// default local stack now uses [`NesBackend::Local`] (llama.cpp
+    /// `llama-server`, OpenAI-compatible).
+    #[deprecated(note = "Local path now routes through llama-server via NesBackend::Local; kept for the legacy Ollama variant.")]
     Ollama,
     /// OpenAI-compatible chat/completions backend (DeepSeek / 通义 / 智谱 / …),
     /// used when the NES completion is served by a remote vendor rather than the
     /// bundled local model (决策 #A).
     OpenAi,
+    /// Local llama.cpp `llama-server` (OpenAI-compatible `/v1/chat/completions`),
+    /// bundled and self-hosted by the GUI sidecar. Reuses the same
+    /// [`ide_probe::OpenAiCompletionBackend`] as the `OpenAi` variant, pointed at
+    /// `http://127.0.0.1:8080/v1` (决策 B：替换 Ollama，消除 minos 死结).
+    Local,
 }
 
 impl NesBackend {
     /// Parse a configuration string into a [`NesBackend`]; anything that is not
-    /// exactly `ollama` / `openai` (case-insensitive) maps to [`NesBackend::Mock`].
+    /// exactly `ollama` / `openai` / `local` (case-insensitive) maps to
+    /// [`NesBackend::Mock`].
     pub fn parse(s: &str) -> NesBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "ollama" => NesBackend::Ollama,
             "openai" => NesBackend::OpenAi,
+            "local" => NesBackend::Local,
             _ => NesBackend::Mock,
         }
     }
 }
 
 /// Which LLM backend drives the ReAct [`Planner`](crate::planner::Planner) and
-/// the [`ChatEngine`](crate::chat::ChatEngine) (aidea LLM backend 模块, 决策 #A).
+/// the [`ChatEngine`](crate::chat::ChatEngine) (aidea LLM backend 模块, 决策 #A / B).
 ///
 /// This is the *reasoning* LLM selector (chat / quest / run-agent). The NES
 /// *completion* backend is selected independently via [`NesBackend`].
@@ -51,21 +61,30 @@ pub enum LlmBackend {
     #[default]
     Mock,
     /// Real local Ollama chat model (the bundled `nes-tab:latest`) via
-    /// `/api/chat`. Zero-config once the bundled model is created.
+    /// `/api/chat`. Kept for backward compatibility; the default local stack now
+    /// uses [`LlmBackend::Local`] (llama.cpp `llama-server`).
+    #[deprecated(note = "Local path now routes through llama-server via LlmBackend::Local; kept for the legacy Ollama variant.")]
     Ollama,
     /// OpenAI-compatible `/v1/chat/completions` (DeepSeek / 通义 / 智谱 / …).
     /// The API key is injected by the GUI into the `aidea serve` environment and
     /// never persisted by the front-end.
     OpenAi,
+    /// Local llama.cpp `llama-server` (OpenAI-compatible `/v1/chat/completions`),
+    /// bundled and self-hosted by the GUI sidecar. Reuses the same
+    /// [`ide_core::llm::OpenAiLlm`] as the `OpenAi` variant, pointed at
+    /// `http://127.0.0.1:8080/v1` (决策 B：替换 Ollama，消除 minos 死结).
+    Local,
 }
 
 impl LlmBackend {
     /// Parse a configuration string into an [`LlmBackend`]; anything that is not
-    /// exactly `ollama` / `openai` (case-insensitive) maps to [`LlmBackend::Mock`].
+    /// exactly `ollama` / `openai` / `local` (case-insensitive) maps to
+    /// [`LlmBackend::Mock`].
     pub fn parse(s: &str) -> LlmBackend {
         match s.trim().to_ascii_lowercase().as_str() {
             "ollama" => LlmBackend::Ollama,
             "openai" => LlmBackend::OpenAi,
+            "local" => LlmBackend::Local,
             _ => LlmBackend::Mock,
         }
     }
@@ -390,7 +409,16 @@ mod tests {
         assert_eq!(LlmBackend::default(), LlmBackend::Mock);
         assert_eq!(LlmBackend::parse("ollama"), LlmBackend::Ollama);
         assert_eq!(LlmBackend::parse("OPENAI"), LlmBackend::OpenAi);
+        assert_eq!(LlmBackend::parse("local"), LlmBackend::Local);
         assert_eq!(LlmBackend::parse("garbage"), LlmBackend::Mock);
+    }
+
+    #[test]
+    fn nes_backend_parse_local() {
+        assert_eq!(NesBackend::parse("ollama"), NesBackend::Ollama);
+        assert_eq!(NesBackend::parse("openai"), NesBackend::OpenAi);
+        assert_eq!(NesBackend::parse("local"), NesBackend::Local);
+        assert_eq!(NesBackend::parse(""), NesBackend::Mock);
     }
 
     #[test]

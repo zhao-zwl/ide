@@ -1,7 +1,7 @@
 //! Sidecar 进程工具：资源路径解析 + 子进程拉起/停止。
 //!
-//! 自包含形态下，PG / Ollama / aidea serve 三个二进制随 .app 置于
-//! `Contents/Resources/bin/`，资源（migrations / 模型 Modelfile）置于
+//! 自包含形态下，PG / llama-server / aidea serve 三个二进制随 .app 置于
+//! `Contents/Resources/bin/`，资源（migrations / 模型权重 GGUF）置于
 //! `Contents/Resources/resources/`。Rust 用 `std::process::Command` 拉起并监管，
 //! 不依赖 tauri-plugin-shell 的 JS 侧 sidecar（进程生命周期由 GUI 持有）。
 
@@ -22,7 +22,7 @@ pub fn resource_path(app: &AppHandle, rel: &str) -> PathBuf {
     resource_dir(app).join(rel)
 }
 
-/// App 数据目录（PG 数据目录、Ollama 模型库置于其下）。
+/// App 数据目录（PG 数据目录、llama.cpp 模型库置于其下）。
 pub fn app_data_dir(app: &AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()

@@ -32,7 +32,7 @@
     "targets": ["dmg", "app"],
     "category": "DeveloperTool",
     "shortDescription": "aidea 自包含 AI IDE（端模型 + 在线厂商）",
-    "longDescription": "单一 .dmg 自包含 GUI：本地 Ollama 端模型零配置对话 + OpenAI 兼容在线厂商路由，内嵌 PostgreSQL 与 aidea serve。",
+    "longDescription": "单一 .dmg 自包含 GUI：本地 llama.cpp 端模型零配置对话 + OpenAI 兼容在线厂商路由，内嵌 PostgreSQL 与 aidea serve。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -44,14 +44,14 @@
     ],
     "externalBin": [
       "bin/aidea",
-      "bin/ollama",
+      "bin/llama-server",
       "bin/postgres",
       "bin/initdb",
       "bin/pg_ctl",
       "bin/psql"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0",
+      "minimumSystemVersion": "10.15",
       "signingIdentity": null,
       "hardened-runtime": false,
       "dmg": {

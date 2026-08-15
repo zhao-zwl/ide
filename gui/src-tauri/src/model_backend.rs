@@ -24,8 +24,13 @@ pub fn to_serve_env(cfg: &VendorConfig, api_key: Option<&str>) -> Vec<(String, S
     ];
     match cfg.kind {
         VendorKind::Local => {
-            env.push(("AIDEA_LLM_BACKEND".to_string(), "ollama".to_string()));
-            env.push(("AIDEA_NES_BACKEND".to_string(), "ollama".to_string()));
+            // 本地路径：复用 llama.cpp llama-server（OpenAI 兼容，127.0.0.1:8080）。
+            env.push(("AIDEA_LLM_BACKEND".to_string(), "local".to_string()));
+            env.push(("AIDEA_NES_BACKEND".to_string(), "local".to_string()));
+            env.push((
+                "AIDEA_LLM_BASE_URL".to_string(),
+                "http://127.0.0.1:8080/v1".to_string(),
+            ));
             env.push(("AIDEA_LLM_MODEL".to_string(), cfg.local_model.clone()));
             env.push(("AIDEA_MODEL_NAME".to_string(), cfg.local_model.clone()));
         }

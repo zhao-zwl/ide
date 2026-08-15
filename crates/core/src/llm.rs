@@ -125,6 +125,11 @@ fn parse_action_directive(text: &str) -> Option<ActionPlan> {
 /// 默认模型为 `nes-tab:latest`（由 qwen2.5:0.5b 顶替的 Modelfile 创建），与
 /// `CoreConfig.model_name` 对齐。GUI 侧以 sidecar 拉起 Ollama 并 `ollama create
 /// nes-tab` 后即可零配置对话。
+///
+/// **已弃用（决策 B）**：M1 默认本地推理后端改为 llama.cpp `llama-server`
+/// （见 [`LlmBackend::Local`] → [`OpenAiLlm`]）。本结构保留以支持历史 `Ollama`
+/// 变体，勿在新代码中引用。
+#[deprecated(note = "Local path now uses OpenAiLlm pointed at llama-server; kept for the legacy Ollama backend variant.")]
 pub struct OllamaLlm {
     endpoint: String,
     model: String,
@@ -332,6 +337,7 @@ impl Llm for OpenAiLlm {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

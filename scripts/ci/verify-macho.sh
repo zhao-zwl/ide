@@ -10,7 +10,7 @@
 #       B3 泄漏   : LC_LOAD_DYLIB 不得含构建机本地路径              → 硬失败
 #       B4 体积   : >= MACHO_MIN_BYTES (2 MiB)                      → 硬失败
 #
-#   --sidecar（run #18 新增，上游下载件 ollama / postgres / initdb / pg_ctl / psql）
+#   --sidecar（run #18 新增，上游下载件 llama-server / postgres / initdb / pg_ctl / psql）
 #       B1 架构   : 必须**含 x86_64 slice**（thin x86_64 或 universal）→ 硬失败
 #       B2 minos  : **只打印、不 gate**。上游用什么 deployment target 我们管不
 #                   了，拿 10.15 去 gate 会误杀；但若 minos 高于我们的目标，
@@ -25,7 +25,7 @@
 # 【为什么 run #18 必须加 sidecar 模式】
 #   run #17 只验了 aidea + aidea-gui（合计 17.4MB，占包体不到 3%）。包里另外
 #   5 个同样要在用户 Intel Mac 上执行的 Mach-O 全部来自上游下载，架构从未检查。
-#   若 Postgres.app / ollama 是 arm64-only，用户机上数据库或推理**启动即失败**，
+#   若 Postgres.app / llama-server 是 arm64-only，用户机上数据库或推理**启动即失败**，
 #   而当时所有断言照样全绿 —— 占包体 95% 以上的部分处于完全无监控状态。
 #
 # 【★ fat (universal) 二进制处理 —— 本脚本最容易翻车的地方】
@@ -62,8 +62,8 @@ set -uo pipefail   # 故意不开 -e：所有断言由脚本自己收敛成最�
 # ---- 体积下限。取值远低于真实体积，只为挡住空文件 / 截断 / 占位脚本。--------
 : "${MACHO_MIN_BYTES:=2097152}"    # 2 MiB —— strict 模式（我们自己编的两个）
 : "${SIDECAR_MIN_BYTES:=16384}"    # 16 KiB —— sidecar 模式（pg 工具本就小）
-: "${BUNDLE_MIN_MACOS:=11.0}"      # sidecar B2 比较基准：本包声明的真实最低系统
-                                   # （打过 minos 补丁后，ollama 真实下限=11.0，不再与 10.15 比）
+: "${BUNDLE_MIN_MACOS:=10.15}"     # sidecar B2 比较基准：本包声明的真实最低系统
+                                   # （llama-server 由本仓库交叉编译，MACOSX_DEPLOYMENT_TARGET=10.15）
 
 # ---- 路径泄漏黑名单（B3）-----------------------------------------------------
 LEAK_RE='(^|/)osxcross(/|$)|^/home/|^/github/|^/builds/|^/__w/|^/tmp/|^/opt/|^/root/|^/mnt/|^/var/lib/'
@@ -184,7 +184,7 @@ arch_desc() {
 # =============================================================================
 
 # mv_arch_section — 从**多架构**dump 文本里切出指定 slice 的那一段。
-#   分隔行形如 `dist/bin/ollama (architecture x86_64):`，cctools 与 llvm 一致。
+#   分隔行形如 `payload/bin/llama-server (architecture x86_64):`，cctools 与 llvm 一致。
 #   若文本里根本没有分隔行（单架构 dump），则原样透传。
 #   ★ 这是防「arm64 排在前面导致读错 slice」的关键，见文件头 ② 。
 mv_arch_section() {
@@ -390,7 +390,7 @@ self_test() {
   #        老 parser 取第一个 Mach header 会读成 arm64 → 假失败。
   #        切段后必须拿到 X86_64 那片。
   local MULTI_H
-  MULTI_H='payload/bin/ollama (architecture arm64):
+  MULTI_H='payload/bin/llama-server (architecture arm64):
 Mach header
       magic  cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
 MH_MAGIC_64    ARM64        ALL  0x00     EXECUTE    30       4520   NOUNDEFS DYLDLINK TWOLEVEL PIE
@@ -400,7 +400,7 @@ Load command 9
  platform 1
     minos 14.0
       sdk 26.0
-payload/bin/ollama (architecture x86_64):
+payload/bin/llama-server (architecture x86_64):
 Mach header
       magic  cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
 MH_MAGIC_64   X86_64        ALL  0x00     EXECUTE    28       4200   NOUNDEFS DYLDLINK TWOLEVEL PIE
@@ -478,10 +478,10 @@ Load command 8
 
   # ── C5) -L 多架构输出按 slice 切依赖
   local MULTI_L
-  MULTI_L='payload/bin/ollama (architecture x86_64):
+  MULTI_L='payload/bin/llama-server (architecture x86_64):
 	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1345.100.2)
 	@rpath/libggml-base.dylib (compatibility version 0.0.0, current version 0.0.0)
-payload/bin/ollama (architecture arm64):
+payload/bin/llama-server (architecture arm64):
 	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1345.100.2)
 	/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 1.0.0)
 	@rpath/libmlx.dylib (compatibility version 0.0.0, current version 0.0.0)'
@@ -909,9 +909,9 @@ main() {
     if [ "$sidecar" = "1" ]; then
       # sidecar：只打印、不 gate。上游 deployment target 不归我们管，
       #          拿 10.15 硬 gate 会误杀。但高于目标时给一条 warning。
-      # ⚠️ 比较基准用 BUNDLE_MIN_MACOS（默认 11.0）而非 expect_minos(=10.15)：
-      #   打过 minos 补丁后，ollama 等 sidecar 的真实下限=11.0，若仍拿 10.15
-      #   去比，会把它「高于本包宣称值」误报出来（run #22 修复点）。
+      # ⚠️ 比较基准用 BUNDLE_MIN_MACOS（默认 10.15）而非 expect_minos：
+      #   本仓库交叉编译的 llama-server 以 MACOSX_DEPLOYMENT_TARGET=10.15 构建，
+      #   若仍拿更高基线去比会误报（run #22 修复点）。
       if [ "$lc" = "NONE" ] || [ "$minos" = "?" ]; then
         echo "::warning::${tag} ${label}: B2 INFO — 未找到 LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX，无法判定 deployment target（仅记录，不阻断）。"
       elif ver_gt "$(norm_ver "$minos")" "$(norm_ver "$BUNDLE_MIN_MACOS")"; then

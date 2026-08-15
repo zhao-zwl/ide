@@ -15,11 +15,11 @@ use tokio_util::sync::CancellationToken;
 /// 后端栈各 sidecar 的子进程句柄 + 当前阶段。
 ///
 /// 外层已由 `AppState.bootstrap: Mutex<BootstrapHandles>` 加锁，因此各字段本身
-/// 无需再各自套一层 Mutex（避免 [`pg.rs`] / [`ollama.rs`] / [`serve.rs`] 写句柄时
+/// 无需再各自套一层 Mutex（避免 [`pg.rs`] / [`llamacpp.rs`] / [`serve.rs`] 写句柄时
 /// 多层锁嵌套）。
 pub struct BootstrapHandles {
     pub pg: Option<Child>,
-    pub ollama: Option<Child>,
+    pub llamacpp: Option<Child>,
     pub serve: Option<Child>,
     pub phase: BootstrapPhase,
 }
@@ -28,7 +28,7 @@ impl BootstrapHandles {
     pub fn new() -> Self {
         Self {
             pg: None,
-            ollama: None,
+            llamacpp: None,
             serve: None,
             phase: BootstrapPhase::Idle,
         }
@@ -49,7 +49,7 @@ pub struct AppState {
     pub aborts: Mutex<HashMap<String, CancellationToken>>,
     /// gRPC 连接状态。
     pub conn_status: Mutex<ConnStatus>,
-    /// App 数据目录（PG 数据目录、Ollama 模型库置于其下）。
+    /// App 数据目录（PG 数据目录、llama.cpp 模型库置于其下）。
     pub app_data_dir: Mutex<Option<PathBuf>>,
     /// bundled PostgreSQL 连接串（由 bootstrap 写入）。
     pub database_url: Mutex<String>,
@@ -62,7 +62,7 @@ impl AppState {
             vendor: Mutex::new(VendorConfig {
                 kind: VendorKind::Local,
                 base_url: None,
-                local_model: "nes-tab:latest".to_string(),
+                local_model: "models/nes-tab/nes-tab.gguf".to_string(),
                 model: None,
             }),
             bootstrap: Mutex::new(BootstrapHandles::new()),

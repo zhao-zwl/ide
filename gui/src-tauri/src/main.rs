@@ -1,7 +1,7 @@
 //! aidea 自包含 macOS GUI 客户端入口（Tauri v2 + React/Vite 前端）。
 //!
 //! 启动流程：注册全局状态与插件 → `setup` 中按 store 的 `auto_bootstrap` 开关
-//! 自动拉起后端栈（PG → Ollama → 模型 → serve）→ 暴露命令层供前端调用。
+//! 自动拉起后端栈（PG → llama.cpp llama-server → serve）→ 暴露命令层供前端调用。
 
 mod bootstrap;
 mod commands;

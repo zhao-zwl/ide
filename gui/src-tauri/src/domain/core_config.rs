@@ -7,7 +7,7 @@ use ide_core::config::{CoreConfig, LlmBackend, NesBackend};
 
 /// 根据当前 vendor 构造进程内 `CoreConfig`：
 ///   * 数据库指向 bundled PostgreSQL（127.0.0.1:5432 / aidea）；
-///   * 本地 → Ollama backend + `nes-tab:latest`；
+///   * 本地 → llama.cpp `llama-server` backend（OpenAI 兼容，127.0.0.1:8080）；
 ///   * 在线 → OpenAI 兼容 backend，Key 从 keyring 读取（进程内瞬时持有）。
 pub fn build_core_config(vendor: &VendorConfig) -> CoreConfig {
     let mut cfg = CoreConfig::default();
@@ -20,10 +20,11 @@ pub fn build_core_config(vendor: &VendorConfig) -> CoreConfig {
 
     match vendor.kind {
         crate::ipc::VendorKind::Local => {
-            cfg.llm_backend = LlmBackend::Ollama;
-            cfg.nes_backend = NesBackend::Ollama;
-            cfg.model_endpoint = "http://localhost:11434".to_string();
-            cfg.model_name = vendor.local_model.clone();
+            cfg.llm_backend = LlmBackend::Local;
+            cfg.nes_backend = NesBackend::Local;
+            // 本地 llama.cpp llama-server（OpenAI 兼容），监听 127.0.0.1:8080。
+            cfg.llm_base_url = "http://127.0.0.1:8080/v1".to_string();
+            cfg.llm_model = vendor.local_model.clone();
         }
         crate::ipc::VendorKind::Online => {
             cfg.llm_backend = LlmBackend::OpenAi;

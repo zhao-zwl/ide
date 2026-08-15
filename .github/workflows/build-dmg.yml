@@ -4,7 +4,7 @@ name: Build aidea macOS bundle (cross-compile)
 # 在 GitHub 免费的 Linux runner（ubuntu-latest，无需绑卡）上：
 #   1. 用 osxcross 把 Rust 代码交叉编译成 x86_64-apple-darwin 原生二进制
 #   2. 用 vite 构建前端
-#   3. 下载 ollama / PostgreSQL 的 macOS 预编译二进制（含其 dylib 与 share 数据）
+  #   3. 交叉编译 llama.cpp llama-server / 下载 PostgreSQL 的 macOS 预编译二进制（含其 dylib 与 share 数据）
 #   4. 打成一个 aidea-bundle.tar.gz Artifact
 #
 # 【故意不做的事】不在这里跑 `tauri build`。
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@v4
 
       # -------------------------------------------------------------------
-      # 磁盘：osxcross SDK(~2G) + cargo target(~6G) + pg/ollama/gguf(~1G)
+      # 磁盘：osxcross SDK(~2G) + cargo target(~6G) + pg/llama-server/gguf(~1G)
       # -------------------------------------------------------------------
       - name: Free up disk space
         run: |
@@ -329,7 +329,7 @@ jobs:
       #     按其能力边界**永远拦不住链接期错误**；到目前为止 `ld:` /
       #     `framework not found` / `Undefined symbols` 一次都没命中过。
       #   * 真正的 Tauri v2 ↔ osxcross framework 链接碰撞，只会发生在 step
-      #     "Cross-compile Rust"，而那一步在 ollama / PostgreSQL / 模型权重三个
+      #     "Cross-compile Rust"，而那一步在 llama-server / PostgreSQL / 模型权重三个
       #     大下载之后，单次代价 9~10 分钟。等编译错误清零后第一次撞上它，
       #     又得白烧一整轮。
       #   * 本探针只花 1~2 秒，且**完全不依赖 Rust 代码编译通过**，就能在流水线
@@ -434,7 +434,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p gui/src-tauri/bin
-          for n in aidea ollama postgres initdb pg_ctl psql; do
+          for n in aidea llama-server postgres initdb pg_ctl psql; do
             f="gui/src-tauri/bin/${n}-${TARGET_TRIPLE}"
             [ -s "$f" ] || printf '#!/bin/sh\nexit 0\n' > "$f"
             chmod +x "$f"
@@ -451,7 +451,7 @@ jobs:
       #   * 必须在 "Build frontend" + "Create sidecar placeholders" 之后 ——
       #     tauri-build 的 build.rs 会校验 frontendDist 与 externalBin 是否存在，
       #     少任何一个都会报出与真实代码无关的假错误；
-      #   * 又必须在 ollama / PostgreSQL / 模型权重三个大下载之前 —— 一旦 Rust
+      #   * 又必须在 llama-server / PostgreSQL / 模型权重三个大下载之前 —— 一旦 Rust
       #     编不过，那几百 MB 下载（模型权重单条 --max-time 900）加几十分钟的
       #     LTO release 构建就全白跑了。
       #
@@ -511,136 +511,43 @@ jobs:
           retention-days: 7
 
       # -------------------------------------------------------------------
-      - name: Download ollama macOS binary
+      - name: Build llama.cpp llama-server (cross-compile via osxcross)
         env:
-          OLLAMA_VERSION: v0.21.0
+          LLAMACPP_TAG: b1056
         run: |
           set -euo pipefail
-          mkdir -p .bundle/bin .bundle/lib
+          mkdir -p .bundle/bin
           WORK="$(mktemp -d)"
-
-          # 固定 ollama 版本，直接走 public release CDN 下载 tarball。
-          # 原实现依赖未认证的 api.github.com 发现资产 URL：未认证上限
-          # 60 req/h/IP，CI runner 共享 IP 极易触发 403 → ASSETS='{}' →
-          # TGZ 为空 → 二进制从不拷贝 → 被 payload 门禁判 MISSING（run #18）。
-          # 改用 releases/download/<tag>/<asset> 直链：匿名可下、无速率限制。
-          # 该 release 仅有 ollama-darwin.tgz（单文件 ollama-darwin 已 404），
-          # 故只保留 tarball 路径；如需换版本改上方 OLLAMA_VERSION 即可。
-          #
-          # ---- 为什么从 v0.32.6 回退到 v0.21.0（最低系统版本）--------------
-          # v0.32.6 的 ollama 二进制 LC_BUILD_VERSION minos=14.0，用户实测机是
-          # macOS 13 (Ventura) ⇒ dyld 直接拒绝加载，端模型完全不可用。
-          # v0.21.0 早于上游把 deployment target 抬到 14.0，且仍带
-          # ollama-darwin.tgz 资产。真实 minos 由本轮 CI 的
-          # `verify-macho --sidecar` 实证读出确认 ≤13，不靠猜。
-          TGZ="https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-darwin.tgz"
-
-          got=0
-          if [ -n "$TGZ" ]; then
-            echo "downloading tarball: $TGZ"
-            if curl -fL --retry 3 --retry-delay 5 -o "$WORK/ollama.tgz" "$TGZ"; then
-              mkdir -p "$WORK/x" && tar -xzf "$WORK/ollama.tgz" -C "$WORK/x"
-
-              # ---- run #18 调查：把 tgz 的**真实目录结构**落盘 ---------------
-              # 背景：run #17 的 payload_check 报 `ollama=63.4MB`，没有
-              # `+runnersXX` 后缀 ⇒ 下面那句 `find -type d -name ollama
-              # -path '*/lib/*'` 没命中 ⇒ .bundle/lib/ollama 是空的。到底是
-              # 「ollama darwin 把 runner 内嵌进单二进制了（无害）」还是
-              # 「runner 是外置的、被我们漏拷了（模型对话直接不可用）」，
-              # 光看体积区分不了，必须把布局本身记下来。
-              #
-              # ⚠️ 注意不要写成 `tar -tzf ... | head -40`：本步骤是
-              #    `set -euo pipefail`，head 提前退出会让 tar 吃 SIGPIPE，
-              #    pipefail 把整条流水线判失败 —— 这正是 b28061c 修过的
-              #    EPIPE 假失败。所以先落盘再 head，全程不跨管道。
-              mkdir -p .ci-facts
-              tar -tzf "$WORK/ollama.tgz" > .ci-facts/ollama-tgz.txt 2>/dev/null || true
-              echo "--- ollama-darwin.tgz 内部布局（共 $(wc -l < .ci-facts/ollama-tgz.txt || echo 0) 条，取前 40）---"
-              head -40 .ci-facts/ollama-tgz.txt || true
-              echo "--- 解包后实际树（depth 2）---"
-              find "$WORK/x" -maxdepth 2 -printf '%y %10s %P\n' 2>/dev/null | sort -k3 | head -40 || true
-
-              BIN="$(find "$WORK/x" -type f -name ollama | head -1 || true)"
-              if [ -n "$BIN" ]; then
-                cp "$BIN" ".bundle/bin/ollama-${TARGET_TRIPLE}"
-                got=1
-
-                # ---- run #22 新增：就地改写 ollama 二进制 minos 14.0 -> 11.0 -----
-                # 用户真机是 macOS 13 (Ventura)，ollama v0.21.0 的 LC_BUILD_VERSION
-                # minos=14.0 会被 dyld 拒绝加载。在打包前就地改写二进制里的 minos
-                # 字段（仅改 dyld 加载门槛，不改运行时 API 调用），让 dyld 放行。
-                # 补丁在 chmod 与随 .app 的 ad-hoc codesign 之前执行，改写字节不会
-                # 破坏我们依赖的签名（ollama 二进制在 CI 里本就未被单独 codesign）。
-                # 真机能否真正加载只能由用户在 macOS 13 的 Intel Mac 上验证；
-                # CI 只负责把补丁做进产物并让注解可证明 minos 已被改写。
-                python3 scripts/ci/patch-macos-minos.py ".bundle/bin/ollama-${TARGET_TRIPLE}" 11.0
-                echo "::notice::patched ollama minos 14.0 -> 11.0 (user macOS 13 workaround)"
-
-                # ---- runner 落盘：兼容「嵌套」与「全平铺」两种上游布局 --------
-                # ollama 运行时固定按 <exe>/../lib/ollama 找 runner，所以不管
-                # 上游怎么摆，进包后都必须落成 .bundle/lib/ollama/。
-                #
-                # 布局 A（旧版，嵌套）：归档里自带现成的 lib/ollama/ 目录。
-                # 布局 B（v0.32.6，全平铺）：ollama 本体与全部 runner 都摊在
-                #   归档根，没有 lib/ollama/ —— run #19 的
-                #   runners=ABSENT(30-in-tgz) 就是只实现了布局 A、把 B 漏掉。
-                #
-                # 布局 B 用「排除主二进制、其余整棵拷」而不是按扩展名 allowlist，
-                # 因为实测 v0.32.6 归档根里 runner 有三类形态，allowlist 会漏：
-                #   · llama-server / llama-quantize     可执行 runner
-                #   · lib*.dylib（含 10 个软链）        llama/ggml 运行时
-                #   · libggml-cpu-*.so（15 个）         x86_64 CPU 后端，
-                #     `*.dylib` 匹配不到，漏了等于 Intel 机没有 CPU 后端
-                #   · mlx_metal_v3/ 、mlx_metal_v4/     Apple Silicon Metal 后端，
-                #     是**子目录**且两者 basename 重名（libmlx.dylib 等），
-                #     平铺拷会互相覆盖，必须原样保留目录结构
-                # rsync -a 同时保住软链与权限位；--exclude='/ollama' 只锚定
-                # 归档根那一个主二进制（已拷进 bin/），不会误伤 mlx_*/ 里的文件。
-                mkdir -p .bundle/lib/ollama
-                LIBDIR="$(find "$WORK/x" -type d -name ollama -path '*/lib/*' | head -1 || true)"
-                if [ -n "$LIBDIR" ]; then
-                  rsync -a "$LIBDIR/" .bundle/lib/ollama/
-                else
-                  # 额外排除 mlx_metal_v3/v4：MLX Metal runner 只在 Apple
-                  # Silicon 上可用，Intel 目标机永远加载不到，白占 ~293MB。
-                  # 若该版本归档里根本没有 mlx_metal_*，exclude 是空操作、无害。
-                  rsync -a --exclude='/ollama' \
-                           --exclude='/mlx_metal_v3' \
-                           --exclude='/mlx_metal_v4' \
-                           "$WORK/x"/ .bundle/lib/ollama/
-                fi
-                echo "bundled ollama runners: $(du -sh .bundle/lib/ollama | cut -f1)"
-                # 不接 head：本步骤 set -o pipefail，head 提前退出会让上游吃
-                # SIGPIPE 变假失败（同本步骤上方 b28061c 的 EPIPE 教训）。
-                find .bundle/lib/ollama -mindepth 1 -maxdepth 1 | sort || true
-              fi
-
-              # ---- runner 三态判定（只观测、不改打包行为）------------------
-              # BUNDLED  : lib/ollama 拷进来了
-              # ABSENT   : tgz 里**确实带**外置 runner（llama-server / *.dylib /
-              #            mlx_*），但没进包 ⇒ 用户机大概率 "no compatible
-              #            runner found"，模型对话不可用
-              # EMBEDDED : tgz 里只有 ollama 本体 ⇒ runner 内嵌，无害
-              RUNNER_STATE="UNKNOWN"; RUNNER_HITS=0
-              if [ -d .bundle/lib/ollama ] && [ -n "$(ls -A .bundle/lib/ollama 2>/dev/null || true)" ]; then
-                RUNNER_STATE="BUNDLED"
-              else
-                RUNNER_HITS="$(grep -cE '(^|/)(llama-server|llama-quantize|ollama_llama_server)$|\.dylib$|(^|/)lib/ollama/|(^|/)mlx' \
-                                 .ci-facts/ollama-tgz.txt 2>/dev/null || true)"
-                RUNNER_HITS="${RUNNER_HITS:-0}"
-                if [ "$RUNNER_HITS" -gt 0 ]; then RUNNER_STATE="ABSENT"; else RUNNER_STATE="EMBEDDED"; fi
-              fi
-              printf '%s %s\n' "$RUNNER_STATE" "$RUNNER_HITS" > .ci-facts/ollama-runners.txt
-              echo "ollama runner state = ${RUNNER_STATE} (tgz 内 runner 类条目 ${RUNNER_HITS} 个)"
-            fi
+          echo "::group::clone llama.cpp @ ${LLAMACPP_TAG}"
+          git clone --depth 1 --branch "${LLAMACPP_TAG}" https://github.com/ggml-org/llama.cpp "$WORK/llama.cpp"
+          echo "::endgroup::"
+          cd "$WORK/llama.cpp"
+          # 决策 B：用 osxcross 交叉编译 llama-server（OpenAI 兼容本地推理后端），替代 ollama。
+          # CMAKE_TOOLCHAIN_FILE 由 crazymax/osxcross 镜像提供，已把编译器 / sysroot /
+          # deployment target 全部指向 x86_64-apple-darwin + 10.15。
+          # 选项名以实测 tag b1056 的 CMakeLists 为准（非设计文档里的旧名）：
+          #   LLAMA_BUILD_SERVER=ON —— 构建 server 示例（产出 llama-server 二进制）
+          #   LLAMA_METAL=OFF        —— Intel 目标机无 Metal
+          #   LLAMA_ACCELERATE=ON    —— 10.15 Intel 走 Accelerate（设计文档的
+          #                          GGML_BLAS_VENDOR=Apple 并非有效值，改用此开关）
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$OSXCROSS_ROOT/toolchain.cmake" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_METAL=OFF \
+            -DLLAMA_ACCELERATE=ON \
+            -DLLAMA_BLAS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target llama-server -j"$(nproc 2>/dev/null || echo 4)"
+          BIN="$(find build -type f -name llama-server | head -1)"
+          if [ -z "$BIN" ]; then
+            echo "::error::llama-server 二进制未产出，交叉编译失败"
+            exit 1
           fi
-
-          if [ "$got" = 1 ]; then
-            chmod +x ".bundle/bin/ollama-${TARGET_TRIPLE}"
-            file ".bundle/bin/ollama-${TARGET_TRIPLE}" || true
-          else
-            echo "::warning::ollama macOS 二进制获取失败，包内将缺少 ollama（端模型对话不可用，在线厂商仍可用）"
-          fi
+          cp "$BIN" ".bundle/bin/llama-server-${TARGET_TRIPLE}"
+          chmod +x ".bundle/bin/llama-server-${TARGET_TRIPLE}"
+          file ".bundle/bin/llama-server-${TARGET_TRIPLE}" || true
           rm -rf "$WORK"
 
       # -------------------------------------------------------------------
@@ -756,7 +663,7 @@ jobs:
           if [ "$ok" = 1 ]; then
             echo "端模型权重已烘焙：$(du -h "$DST" | cut -f1)"
           else
-            echo "::warning::端模型权重下载失败，包将退化为「首次启动联网让 ollama 拉取」模式"
+            echo "::warning::端模型权重下载失败，包将退化为「本地未烘焙 GGUF 时由 llama-server 从资源目录加载」模式"
           fi
 
       # -------------------------------------------------------------------
@@ -764,17 +671,17 @@ jobs:
       #
       # 为什么必须有这一步：上面三个下载步骤的所有失败路径都是
       # `::warning::` + `exit 0` —— 下载失败时步骤照样 success。run #16 里
-      # ollama 4s / PostgreSQL 4s / 模型权重 11s 三步全绿、artifact 586.22 MiB，
+          # llama-server 构建 / PostgreSQL 4s / 模型权重 11s 三步全绿、artifact 586.22 MiB，
       # 但这个总量**无法归因到具体哪一项**，"三步绿" 并不证明三样东西都在包里。
       # 本步骤把隐式 warning 变成显式断言，并把分项体积打进注解。
       #
       # 位置：刻意放在 "Cross-compile Rust" **之前**。缺件就立刻失败，
       #       不必先白烧 142s 的 LTO 构建（沿用 Fast frontend check 的同款思路）。
       #
-      # 口径：ollama / PostgreSQL 缺失 ⇒ 硬失败（后端栈必需）；
+          # 口径：llama-server / PostgreSQL 缺失 ⇒ 硬失败（后端栈必需）；
       #       模型权重维持 best-effort，但注解里必须明确 BAKED / SKIPPED。
       # -------------------------------------------------------------------
-      - name: Verify downloaded payload components (ollama / postgres / model)
+      - name: Verify downloaded payload components (llama-server / postgres / model)
         run: |
           set +e -o pipefail
           trap 'echo "::error::PAYLOAD_VERIFY_UNCAUGHT rc=$? line=$LINENO"' ERR
@@ -897,7 +804,7 @@ jobs:
           if [ -d .bundle/bin ]; then cp -a .bundle/bin/. "$STAGE/payload/bin/"; fi
           chmod +x "$STAGE"/payload/bin/* 2>/dev/null || true
 
-          # ③ 运行时依赖（postgres dylib / share，ollama runner）
+          # ③ 运行时依赖（postgres dylib / share；llama-server 为单二进制无需额外 runner）
           if [ -d .bundle/lib ];   then cp -a .bundle/lib/.   "$STAGE/payload/lib/";   fi
           if [ -d .bundle/share ]; then cp -a .bundle/share/. "$STAGE/payload/share/"; fi
 
@@ -1027,8 +934,8 @@ jobs:
           #
           # 为什么必须加：上面两个二进制合计 17.4MB，占包体不到 3%。包里另外
           # 5 个同样要在用户 Intel Mac 上执行的 Mach-O 全部来自上游下载
-          # （ollama 的 tgz、Postgres.app 的 dmg），架构从未检查过。
-          # Postgres.app / ollama 近年版本完全可能是 arm64-only 或 universal —— 
+          # （llama-server 由 osxcross 交叉编译、Postgres.app 的 dmg），架构从未检查过。
+          # Postgres.app / llama-server 近年版本完全可能是 arm64-only 或 universal —— 
           # 若是 arm64-only，用户 Intel 机上数据库或推理**启动即失败**，
           # 而此前所有断言照样全绿。占包体 95% 以上的部分等于零监控。
           #
@@ -1042,7 +949,7 @@ jobs:
           # ⚠️ 若某个 sidecar 是 arm64-only：这里会**硬失败**并把事实打进注解。
           #    这是刻意的 —— 不自动改下载源，先拿到事实再决定对策。
           bash scripts/ci/verify-macho.sh --sidecar "x86_64" "${MACOSX_DEPLOYMENT_TARGET}" \
-            "ollama=${STAGE}/payload/bin/ollama-${TARGET_TRIPLE}" \
+            "llama_server=${STAGE}/payload/bin/llama-server-${TARGET_TRIPLE}" \
             "postgres=${STAGE}/payload/bin/postgres-${TARGET_TRIPLE}" \
             "initdb=${STAGE}/payload/bin/initdb-${TARGET_TRIPLE}" \
             "pg_ctl=${STAGE}/payload/bin/pg_ctl-${TARGET_TRIPLE}" \

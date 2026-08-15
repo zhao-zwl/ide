@@ -45,7 +45,7 @@ readonly MAIN_BIN="aidea-gui"
 
 # 6 个 sidecar：Rust 侧 `bootstrap::sidecar::bin_path()` 解析为
 # `resource_dir()/bin/<name>`，即 aidea.app/Contents/Resources/bin/<name>（无 triple 后缀）。
-SIDECARS=(aidea ollama postgres initdb pg_ctl psql)
+SIDECARS=(aidea llama-server postgres initdb pg_ctl psql)
 # 缺失即无法启动的关键 sidecar（其余缺失只告警、降级运行）
 CRITICAL_SIDECARS=(aidea)
 
@@ -156,11 +156,11 @@ fi
 #        MacOS/aidea-gui                 主二进制（CFBundleExecutable）
 #        MacOS/<sidecar>                 -> ../Resources/bin/<sidecar> 兼容软链（可关）
 #        Resources/bin/<sidecar>         6 个 sidecar（去掉 triple 后缀）
-#        Resources/lib/                  postgres 依赖 dylib + ollama runner
-#                                        （postgres/ollama 均按 <exe>/../lib 查找）
+#        Resources/lib/                  postgres 依赖 dylib
+#                                        （postgres 按 <exe>/../lib 查找；llama-server 为单二进制）
 #        Resources/share/                postgres initdb 模板等（<exe>/../share）
 #        Resources/resources/migrations  SQL 迁移（resource_path "resources/migrations"）
-#        Resources/resources/models/...  Modelfile + 可选 qwen2.5-0.5b.gguf
+#        Resources/resources/models/...  可选内置端模型 qwen2.5-0.5b.gguf（GGUF）
 #        Resources/dist/                 前端静态文件（Tauri v2 已内嵌进二进制，此处为留档）
 #        Resources/icons/icon.png, Resources/icon.icns
 # ---------------------------------------------------------------------------
@@ -209,14 +209,15 @@ if [ -n "$MISSING_SIDECARS" ]; then
   warn "以下 sidecar 缺失，对应功能将降级：$MISSING_SIDECARS"
 fi
 
-# --- postgres / ollama 的运行时依赖（lib / share）----------------------------
-# postgres、psql、ollama 都用 @loader_path/.. 或 <exe>/.. 相对定位依赖，
+# --- postgres / llama-server 的运行时依赖（lib / share）-----------------------
+# postgres、psql 用 @loader_path/.. 或 <exe>/.. 相对定位依赖，
 # 因此 bin 与 lib/share 必须是同级兄弟目录（都在 Contents/Resources 下）。
+# llama-server 为单二进制（无 lib/ 依赖），只需 bin/llama-server 即可。
 if [ -d "$PAYLOAD/lib" ]; then
   copy_tree "$PAYLOAD/lib" "$RES_DIR/lib"
   log "运行时库 -> Contents/Resources/lib ($(find "$RES_DIR/lib" -type f 2>/dev/null | wc -l | tr -d ' ') 个文件)"
 else
-  warn "bundle 无 lib/ —— postgres/ollama 可能因缺少 dylib 无法启动"
+  warn "bundle 无 lib/ —— postgres 可能因缺少 dylib 无法启动"
 fi
 if [ -d "$PAYLOAD/share" ]; then
   copy_tree "$PAYLOAD/share" "$RES_DIR/share"
@@ -229,13 +230,14 @@ fi
 if [ -d "$PAYLOAD/resources" ]; then
   copy_tree "$PAYLOAD/resources" "$RES_DIR/resources"
   log "Tauri 资源 -> Contents/Resources/resources"
-  if [ -f "$RES_DIR/resources/models/nes-tab/qwen2.5-0.5b.gguf" ]; then
+  if [ -f "$RES_DIR/resources/models/nes-tab/nes-tab.gguf" ] \
+     || [ -f "$RES_DIR/resources/models/nes-tab/qwen2.5-0.5b.gguf" ]; then
     log "  端模型权重已内置（离线可用）"
   else
-    warn "  未内置 qwen2.5-0.5b.gguf —— 首次启动需联网让 ollama 拉取基础权重"
+    warn "  未内置端模型 GGUF —— 首次启动若未放置权重，本地 chat 将不可用"
   fi
 else
-  warn "bundle 无 resources/ —— 数据库迁移与端模型 Modelfile 将缺失"
+  warn "bundle 无 resources/ —— 数据库迁移与端模型权重将缺失"
 fi
 
 # --- 前端 dist（Tauri v2 在编译期已内嵌，这里仅留档/便于排查）----------------
@@ -363,8 +365,6 @@ if [ -d "$RES_DIR/bin" ]; then
 fi
 if [ -d "$RES_DIR/lib" ]; then
   find "$RES_DIR/lib" -type f -name '*.dylib' -exec chmod +x {} + 2>/dev/null || true
-  # ollama 的 runner 可执行文件也在 lib/ollama 下
-  find "$RES_DIR/lib" -type f -name 'ollama*' -exec chmod +x {} + 2>/dev/null || true
 fi
 if [ "$IS_MACOS" = "1" ]; then
   xattr -cr "$APP_DIR" 2>/dev/null || true

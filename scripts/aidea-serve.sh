@@ -4,9 +4,11 @@
 set -e
 
 export AIDEA_DATABASE_URL="postgres://aidea:aidea@localhost:5432/aidea"
-export AIDEA_MODEL_ENDPOINT="http://localhost:11434"
-export AIDEA_MODEL_NAME="nes-tab:latest"
-export AIDEA_NES_BACKEND="ollama"
+export AIDEA_LLM_BACKEND="local"
+export AIDEA_NES_BACKEND="local"
+export AIDEA_LLM_BASE_URL="http://127.0.0.1:8080/v1"
+export AIDEA_LLM_MODEL="models/nes-tab/nes-tab.gguf"
+export AIDEA_MODEL_NAME="models/nes-tab/nes-tab.gguf"
 export AIDEA_SINGLE_TENANT="true"
 export AIDEA_TENANT_ID="single"
 

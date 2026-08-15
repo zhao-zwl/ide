@@ -158,6 +158,11 @@ pub fn should_retry(attempt: u32, max_retries: u32) -> bool {
 /// per-request timeout and exponential backoff retry; `/api/embeddings` for
 /// vectorization. Network calls are isolated here; [`NesClient`] adds the
 /// cache / degradation / batch orchestration.
+///
+/// **已弃用（决策 B）**：M1 默认本地推理后端改为 llama.cpp `llama-server`
+/// （`NesBackend::Local` → [`OpenAiCompletionBackend`]）。本结构保留以支持历史
+/// `Ollama` 变体与 `Mock` 之外的离线测试，勿在新代码中引用。
+#[deprecated(note = "Local path now routes through llama-server via OpenAiCompletionBackend; kept for the legacy Ollama backend variant.")]
 #[derive(Clone)]
 pub struct OllamaClient {
     config: OllamaConfig,
@@ -472,6 +477,7 @@ pub async fn run_batch(
 /// in-memory cache, a rule-based degradation fallback, and bounded-concurrency
 /// batch inference. This is the backend selected by `CoreConfig.nes_backend =
 /// "ollama"` (T09/T10).
+#[allow(deprecated)]
 pub struct NesClient {
     real: Arc<OllamaClient>,
     as_backend: Arc<dyn CompletionBackend>,
@@ -480,6 +486,7 @@ pub struct NesClient {
     batch_concurrency: usize,
 }
 
+#[allow(deprecated)]
 impl NesClient {
     pub fn from_config(cfg: &OllamaConfig) -> Self {
         let real = Arc::new(OllamaClient::new(cfg.clone()));
