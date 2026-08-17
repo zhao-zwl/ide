@@ -539,6 +539,17 @@ jobs:
           echo "::endgroup::"
           cd "$WORK/llama.cpp"
 
+          # 决策 D（修复 run #31 链接错误）：common 库在 common/CMakeLists.txt:55 被显式声明为
+          # add_library(${TARGET} STATIC)，因此 BUILD_SHARED_LIBS=ON（T14）不会把它翻成 SHARED。
+          # 结果 server.cpp.o 引用的 common_* 符号（common_token_to_piece / common_sampler_* /
+          # common_embd_normalize）因静态归档链接顺序问题再次 undefined reference（run #31 实证）。
+          # 本地核实（/tmp/llama-local/llama.cpp b4585）：这些符号在 common/common.cpp 中完好存在且
+          # 签名一致（common_token_to_piece(llama_context*,llama_token,bool) 等），与 run #30 的
+          # libllama 静态库归档顺序问题同源，绝非 API 漂移。故此处把 common 也改成 SHARED，与 T14
+          # 对 llama 的处理对称 —— 共享库无归档顺序问题，common_* 从 libcommon.dylib 正常解析。
+          # 注意：common 改 SHARED 后，libcommon*.dylib 须随 llama-server 一并打包（见下方 dylib 拷贝）。
+          sed -i.bak 's/add_library(${TARGET} STATIC/add_library(${TARGET} SHARED/' common/CMakeLists.txt
+
           # 决策 B：用 osxcross 交叉编译 llama-server（OpenAI 兼容本地推理后端），替代 ollama。
           # 健壮性修复（run #23 黑盒失败复盘）：
           #   1) 不再依赖 osxcross 镜像隐式 CMAKE_TOOLCHAIN_FILE（路径缺失即 fatal，且黑盒），
@@ -636,6 +647,21 @@ jobs:
           cp "$BIN" "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}"
           chmod +x "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}"
           file "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}" || true
+
+          # 决策 D 收尾：common / llama 已为 SHARED，运行期 llama-server 需在同目录（@loader_path）
+          # 找到 libcommon*.dylib / libllama*.dylib。把构建产出的全部 .dylib 一并拷进 .bundle/bin，
+          # 保证进 .app 后能独立运行（无需系统路径的 dylib）。find 递归覆盖 build 下任意子目录。
+          echo "::group::collect llama.cpp shared libs"
+          found_dylib=0
+          while IFS= read -r -d '' dylib; do
+            cp "$dylib" "$REPO_ROOT/.bundle/bin/"
+            echo "  + $(basename "$dylib")"
+            found_dylib=1
+          done < <(find build -type f -name '*.dylib' -print0)
+          if [ "$found_dylib" -eq 0 ]; then
+            echo "::warning::未找到任何 .dylib（common/llama SHARED 构建预期产出），运行期 llama-server 可能缺依赖"
+          fi
+          echo "::endgroup::"
           rm -rf "$WORK"
 
       # T13：llama.cpp 编译/配置诊断日志上传（即便上一步失败也运行，if: always()）。
