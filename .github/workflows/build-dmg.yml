@@ -527,6 +527,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .bundle/bin
+          # 关键：本 step 内会 cd 进 clone 目录（$WORK/llama.cpp），之后所有 .bundle 相对路径
+          # 都会解析到 clone 目录内（而非仓库根），导致诊断日志/二进制被写到 mktemp 临时目录、
+          # 上传步（仓库根）找不到 → artifact 缺失；且成功路径 rm -rf "$WORK" 会一并删除二进制。
+          # 故用 REPO_ROOT 锚定仓库根，所有 .bundle 写入统一走绝对路径（修复 run #30 artifact 缺失 + 潜在二进制丢失）。
+          REPO_ROOT="$(pwd)"
           WORK="$(mktemp -d)"
           echo "::group::clone llama.cpp @ ${LLAMACPP_TAG}"
           git clone --depth 1 --branch "${LLAMACPP_TAG}" https://github.com/ggml-org/llama.cpp "$WORK/llama.cpp" \
@@ -604,9 +609,9 @@ jobs:
             # T13 自报告兜底：把诊断日志落盘 + 写进 run Summary，失败可直接在 GitHub UI
             # 下载/查看，彻底摆脱对 token / annotations API 的依赖（run #28/#29 黑盒复盘：
             # 公开 API 注解为空、原始日志 403 不可读）。后续 if: always() 步会把该目录上传为 artifact。
-            mkdir -p .bundle/diagnostics
-            cp /tmp/llama-cfg.log   .bundle/diagnostics/ 2>/dev/null || true
-            cp /tmp/llama-build.log .bundle/diagnostics/ 2>/dev/null || true
+            mkdir -p "$REPO_ROOT/.bundle/diagnostics"
+            cp /tmp/llama-cfg.log   "$REPO_ROOT/.bundle/diagnostics/" 2>/dev/null || true
+            cp /tmp/llama-build.log "$REPO_ROOT/.bundle/diagnostics/" 2>/dev/null || true
             {
               echo "## llama.cpp build failed (configure_rc=${rc1} build_rc=${rc2})"
               echo
@@ -628,9 +633,9 @@ jobs:
             echo "::error::llama-server 二进制未产出，交叉编译失败"
             exit 1
           fi
-          cp "$BIN" ".bundle/bin/llama-server-${TARGET_TRIPLE}"
-          chmod +x ".bundle/bin/llama-server-${TARGET_TRIPLE}"
-          file ".bundle/bin/llama-server-${TARGET_TRIPLE}" || true
+          cp "$BIN" "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}"
+          chmod +x "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}"
+          file "$REPO_ROOT/.bundle/bin/llama-server-${TARGET_TRIPLE}" || true
           rm -rf "$WORK"
 
       # T13：llama.cpp 编译/配置诊断日志上传（即便上一步失败也运行，if: always()）。
