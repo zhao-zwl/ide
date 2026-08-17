@@ -589,6 +589,25 @@ jobs:
             echo "::error::=== llama.cpp CONFIGURE log (tail 40, rc=${rc1}) ==="
             { tail -n 40 /tmp/llama-cfg.log 2>/dev/null | while IFS= read -r l; do
                 echo "::error::cfg: $l"; done; } || true
+
+            # T13 自报告兜底：把诊断日志落盘 + 写进 run Summary，失败可直接在 GitHub UI
+            # 下载/查看，彻底摆脱对 token / annotations API 的依赖（run #28/#29 黑盒复盘：
+            # 公开 API 注解为空、原始日志 403 不可读）。后续 if: always() 步会把该目录上传为 artifact。
+            mkdir -p .bundle/diagnostics
+            cp /tmp/llama-cfg.log   .bundle/diagnostics/ 2>/dev/null || true
+            cp /tmp/llama-build.log .bundle/diagnostics/ 2>/dev/null || true
+            {
+              echo "## llama.cpp build failed (configure_rc=${rc1} build_rc=${rc2})"
+              echo
+              echo '```'
+              tail -n 80 /tmp/llama-build.log 2>/dev/null
+              echo '```'
+              echo
+              echo '### configure log tail'
+              echo '```'
+              tail -n 40 /tmp/llama-cfg.log 2>/dev/null
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY:-/tmp/llama-summary.md}"
             exit 1
           fi
 
@@ -602,6 +621,18 @@ jobs:
           chmod +x ".bundle/bin/llama-server-${TARGET_TRIPLE}"
           file ".bundle/bin/llama-server-${TARGET_TRIPLE}" || true
           rm -rf "$WORK"
+
+      # T13：llama.cpp 编译/配置诊断日志上传（即便上一步失败也运行，if: always()）。
+      # 失败时可在 GitHub Actions 的 Artifacts 区直接下载 llama-cpp-diagnostics 查看完整日志，
+      # 无需 token、不依赖 annotations API。
+      - name: Upload llama.cpp build diagnostics (on failure)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-diagnostics
+          path: .bundle/diagnostics/
+          if-no-files-found: ignore
 
       # -------------------------------------------------------------------
       # PostgreSQL：取 Postgres.app 的 macOS 构建。
