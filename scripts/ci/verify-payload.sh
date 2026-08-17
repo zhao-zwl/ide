@@ -38,7 +38,7 @@ set -uo pipefail   # 不开 -e：由脚本自己收敛退出码
 : "${TARGET_TRIPLE:=x86_64-apple-darwin}"
 
 # ---- 体积下限（字节）。可用环境变量覆盖，便于将来调参而不改脚本。----------
-: "${MIN_LLAMACPP_BYTES:=8388608}"      #  8 MiB —— llama-server 单二进制（原 ollama 下限复用）
+: "${MIN_LLAMACPP_BYTES:=8388608}"      #  8 MiB —— llama-server 主二进制 + 同目录 *.dylib 合计（SHARED 构建下主二进制仅 ~3MB，体积在 dylib 中；静态构建则单二进制即数十 MiB）。保守下限仅挡空文件/HTML/截断。
 : "${MIN_PGTOOL_BYTES:=32768}"        # 32 KiB —— 单个 pg 可执行文件
 : "${MIN_PGSHARE_BYTES:=1048576}"     #  1 MiB —— initdb 模板/时区数据
 : "${MIN_PGLIB_BYTES:=1048576}"       #  1 MiB —— libpq 等 dylib
@@ -65,23 +65,34 @@ main() {
   # =========================================================================
   # C2-a  llama-server —— 缺失硬失败（决策 B：替代 ollama 的本地推理后端）
   # =========================================================================
-  local llamacpp_bin llamacpp_sz llamacpp_rep
+  local llamacpp_bin llamacpp_sz llamacpp_rep llamacpp_total llamacpp_libs=0 d
   llamacpp_bin="${BUNDLE}/bin/llama-server-${TARGET_TRIPLE}"
   llamacpp_sz="$(file_size "$llamacpp_bin")"
 
   echo "--- llama-server ---"
   ls -lh "$llamacpp_bin" 2>/dev/null || echo "  (缺失: $llamacpp_bin)"
 
+  # SHARED 构建（T14/T16）下主二进制仅 ~3MB，体积分散到同目录 libllama*.dylib /
+  # libcommon*.dylib。故以「主二进制 + 同目录全部 *.dylib」合计体积做断言：
+  # 既保留对空文件 / HTML 错误页 / 截断的防护（合法 SHARED 构建必带 dylib，合计远超下限），
+  # 又不会把合法的共享链接二进制误杀。静态构建无 dylib，合计即主二进制本身（数十 MiB），同样通过。
+  llamacpp_total="$llamacpp_sz"
+  for d in "$BUNDLE/bin"/*.dylib; do
+    [ -f "$d" ] || continue
+    llamacpp_libs=$((llamacpp_libs + $(file_size "$d")))
+    llamacpp_total=$((llamacpp_total + $(file_size "$d")))
+  done
+
   if [ ! -f "$llamacpp_bin" ]; then
     echo "::error::payload_check llama_server: MISSING — ${llamacpp_bin} 不存在。llama.cpp 交叉编译产物未产出，或 tarball 分支未命中。缺 llama-server ⇒ 端模型对话完全不可用。"
     n_fail=$((n_fail + 1))
     llamacpp_rep="MISSING"
-  elif [ "$llamacpp_sz" -lt "$MIN_LLAMACPP_BYTES" ]; then
-    echo "::error::payload_check llama_server: TOO SMALL — 实际 ${llamacpp_sz} B（$(human "$llamacpp_sz")）低于下限 ${MIN_LLAMACPP_BYTES} B（$(human "$MIN_LLAMACPP_BYTES")）。疑似下到 HTML 错误页或文件被截断。"
+  elif [ "$llamacpp_total" -lt "$MIN_LLAMACPP_BYTES" ]; then
+    echo "::error::payload_check llama_server: TOO SMALL — 主二进制 ${llamacpp_sz} B + dylib ${llamacpp_libs} B = 合计 ${llamacpp_total} B（$(human "$llamacpp_total")）低于下限 ${MIN_LLAMACPP_BYTES} B（$(human "$MIN_LLAMACPP_BYTES")）。疑似下到 HTML 错误页或文件被截断（合法 SHARED 构建应同目录带 libllama/libcommon dylib）。"
     n_fail=$((n_fail + 1))
-    llamacpp_rep="CORRUPT($(human "$llamacpp_sz"))"
+    llamacpp_rep="CORRUPT($(human "$llamacpp_total"))"
   else
-    llamacpp_rep="$(human "$llamacpp_sz")"
+    llamacpp_rep="$(human "$llamacpp_total")$([ "$llamacpp_libs" -gt 0 ] && echo "+libs($(human "$llamacpp_libs"))")"
   fi
 
   # =========================================================================
