@@ -550,6 +550,15 @@ jobs:
           # if(${CMAKE_SYSTEM_PROCESSOR} MATCHES ...) 展开成 "if ( MATCHES ...)" 语法错误，
           # configure_rc=1（run #25/#26 死因，T8 修 CLANG 后仍复现）。必须显式指定 x86_64，
           # 同时让架构分支正确落到 x86/AVX2（line 442）。
+          #
+          # 决策 C（修复 run #30 链接错误）：将 BUILD_SHARED_LIBS 从 OFF 改为 ON（SHARED 构建）。
+          # run #30 根因 = llama.cpp 静态库归档链接顺序问题：server.cpp.o 引用
+          # llama_n_ctx / llama_n_batch / llama_model_size，但 -llama 静态归档在链接行中位于
+          # server 目标文件之前，链接器处理归档时尚无未定义符号可匹配，故未抽取
+          # llama-context.o / llama-model.o，导致这几个 C API 符号 undefined reference。
+          # 改用 SHARED 库后无归档顺序问题，且 BUILD_SHARED_LIBS=ON 会令 llama.cpp 注入
+          # LLAMA_SHARED → LLAMA_API 以 visibility("default") 导出这些符号，server 正常链接。
+          # 注：下方 cmake 参数请保持纯 -D 续行，勿在反斜杠续行中间插入 '#' 注释（会被当作命令参数/截断）。
           cmake -S . -B build \
             -DCMAKE_SYSTEM_NAME=Darwin \
             -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
@@ -565,7 +574,9 @@ jobs:
             -DGGML_ACCELERATE=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_OPENMP=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_RPATH=@loader_path \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             2>&1 | tee /tmp/llama-cfg.log
           rc1=${PIPESTATUS[0]}
